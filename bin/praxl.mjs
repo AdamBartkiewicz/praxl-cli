@@ -4,8 +4,9 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import readline from "readline";
+import { exec } from "child_process";
 
-const VERSION = "1.0.0";
+const VERSION = "2.1.1";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
 const TOKEN_FILE = path.join(CONFIG_DIR, "token");
@@ -64,6 +65,13 @@ function getUrl() {
 function prompt(q) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((r) => rl.question(q, (a) => { rl.close(); r(a.trim()); }));
+}
+
+// ─── Open browser ──────────────────────────────────────────────────────────
+
+function openBrowser(url) {
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  exec(`${cmd} "${url}"`);
 }
 
 // ─── API helpers ────────────────────────────────────────────────────────────
@@ -125,6 +133,248 @@ function scanLocalSkills(dir) {
     }
     return { slug, name, description: description.slice(0, 500), content, files };
   });
+}
+
+// ─── Scan command (zero signup, local only) ────────────────────────────────
+
+const SCAN_PATHS = {
+  "claude-code": [
+    path.join(HOME, ".claude", "skills"),
+    path.join(HOME, ".claude", "commands"),
+  ],
+  "cursor": [
+    path.join(HOME, ".cursor", "skills"),
+    path.join(HOME, ".cursor", "rules"),
+  ],
+  "codex": [
+    path.join(HOME, ".agents", "skills"),
+  ],
+  "windsurf": [
+    path.join(HOME, ".windsurf", "skills"),
+    path.join(HOME, ".windsurf", "rules"),
+  ],
+  "opencode": [
+    path.join(HOME, ".opencode", "skills"),
+  ],
+  "gemini-cli": [
+    path.join(HOME, ".gemini", "skills"),
+  ],
+  "copilot": [
+    path.join(HOME, ".github", "copilot-instructions"),
+  ],
+  "claude.ai": [
+    path.join(HOME, ".claude", "skills"),
+  ],
+};
+
+function scanAllPlatforms() {
+  const results = []; // { platform, dir, slug, content, hash }
+
+  function hash(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+    return h;
+  }
+
+  for (const [platform, dirs] of Object.entries(SCAN_PATHS)) {
+    for (const dir of dirs) {
+      if (!fs.existsSync(dir)) continue;
+      let entries;
+      try { entries = fs.readdirSync(dir); } catch { continue; }
+      for (const entry of entries) {
+        const skillMd = path.join(dir, entry, "SKILL.md");
+        const singleFile = path.join(dir, entry);
+        let content = null;
+        let slug = entry;
+
+        if (fs.existsSync(skillMd) && fs.statSync(skillMd).isFile()) {
+          content = fs.readFileSync(skillMd, "utf-8");
+        } else if (entry.endsWith(".md") && fs.statSync(singleFile).isFile()) {
+          content = fs.readFileSync(singleFile, "utf-8");
+          slug = entry.replace(/\.md$/, "");
+        }
+
+        if (content) {
+          results.push({ platform, dir, slug, content, hash: hash(content) });
+        }
+      }
+    }
+  }
+  return results;
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function cmdScan() {
+  const c = {
+    reset: "\x1b[0m",
+    dim: "\x1b[2m",
+    bold: "\x1b[1m",
+    green: "\x1b[32m",
+    yellow: "\x1b[33m",
+    red: "\x1b[31m",
+    cyan: "\x1b[36m",
+    white: "\x1b[97m",
+  };
+
+  console.log();
+
+  // Map unique dirs to their platform labels (for display)
+  const dirToPlatforms = new Map(); // resolved dir → [platform names]
+  for (const [platform, dirs] of Object.entries(SCAN_PATHS)) {
+    for (const dir of dirs) {
+      const resolved = path.resolve(dir);
+      if (!dirToPlatforms.has(resolved)) dirToPlatforms.set(resolved, []);
+      const list = dirToPlatforms.get(resolved);
+      if (!list.includes(platform)) list.push(platform);
+    }
+  }
+
+  // Scan each unique directory once
+  // Track: dirKey → [{ slug, hash, content }]
+  const scannedDirs = []; // { resolvedDir, platforms, skills: [{ slug, hash }] }
+
+  for (const [resolvedDir, platforms] of dirToPlatforms) {
+    if (!fs.existsSync(resolvedDir)) continue;
+    let entries;
+    try { entries = fs.readdirSync(resolvedDir); } catch { continue; }
+
+    const skills = [];
+    for (const entry of entries) {
+      const skillMd = path.join(resolvedDir, entry, "SKILL.md");
+      const singleFile = path.join(resolvedDir, entry);
+      let content = null;
+      let slug = entry;
+
+      try {
+        if (fs.existsSync(skillMd) && fs.statSync(skillMd).isFile()) {
+          content = fs.readFileSync(skillMd, "utf-8");
+        } else if (entry.endsWith(".md") && fs.statSync(singleFile).isFile()) {
+          content = fs.readFileSync(singleFile, "utf-8");
+          slug = entry.replace(/\.md$/, "");
+        }
+      } catch { continue; }
+
+      if (content) {
+        let h = 0;
+        for (let i = 0; i < content.length; i++) h = ((h << 5) - h + content.charCodeAt(i)) | 0;
+        skills.push({ slug, hash: h });
+      }
+    }
+
+    if (skills.length > 0) {
+      scannedDirs.push({ resolvedDir, platforms, skills });
+      const displayDir = resolvedDir.replace(HOME, "~");
+      process.stdout.write(`  Scanning ${c.dim}${displayDir.padEnd(30)}${c.reset} found ${c.bold}${skills.length} skills${c.reset}\n`);
+      await sleep(150);
+    }
+  }
+
+  // Count unique skills across all scanned dirs
+  // A slug in dir A and dir B = duplicate (exists in 2 locations)
+  const slugLocations = new Map(); // slug → [{ dir, platforms, hash }]
+  for (const { resolvedDir, platforms, skills } of scannedDirs) {
+    for (const s of skills) {
+      if (!slugLocations.has(s.slug)) slugLocations.set(s.slug, []);
+      slugLocations.get(s.slug).push({ dir: resolvedDir, platforms, hash: s.hash });
+    }
+  }
+
+  const uniqueSlugs = slugLocations.size;
+  const totalLocations = [...slugLocations.values()].reduce((sum, locs) => sum + locs.length, 0);
+  const totalTools = scannedDirs.length;
+
+  if (uniqueSlugs === 0) {
+    console.log(`\n  ${c.dim}No skills found on this machine.${c.reset}`);
+    console.log(`\n  Create your first skill:`);
+    console.log(`  ${c.cyan}mkdir -p ~/.claude/skills/my-skill${c.reset}`);
+    console.log(`  Then create a SKILL.md inside it.`);
+    console.log(`\n  Learn more: ${c.cyan}https://praxl.app${c.reset}\n`);
+    return;
+  }
+
+  // Analyze duplicates & outdated
+  const duplicateSlugs = []; // slugs that exist in 2+ directories
+  const outdatedSlugs = []; // duplicates with different content
+  let notSyncedCount = 0; // slugs only in 1 directory
+
+  for (const [slug, locs] of slugLocations) {
+    if (locs.length > 1) {
+      duplicateSlugs.push(slug);
+      const hashes = new Set(locs.map(l => l.hash));
+      if (hashes.size > 1) outdatedSlugs.push(slug);
+    } else {
+      notSyncedCount++;
+    }
+  }
+
+  // Estimate: ~2 min per skill per extra location, ~1.5 updates/week
+  const weeklyMinutes = totalTools > 1 ? Math.round(uniqueSlugs * (totalTools - 1) * 2 * 1.5 / totalTools) : 0;
+
+  // ── Summary box ──
+  // Use a simple function to pad lines inside the box
+  const BOX_W = 45;
+  const boxLine = (text, rawLen) => {
+    const pad = Math.max(1, BOX_W - rawLen - 2);
+    return `  ${c.dim}|${c.reset}  ${text}${" ".repeat(pad)}${c.dim}|${c.reset}`;
+  };
+
+  console.log();
+  console.log(`  ${c.dim}┌${"─".repeat(BOX_W)}┐${c.reset}`);
+
+  const mainLine = `${uniqueSlugs} skills across ${totalTools} location${totalTools !== 1 ? "s" : ""}`;
+  console.log(boxLine(`${c.bold}${c.white}${uniqueSlugs} skills${c.reset} across ${c.bold}${totalTools} location${totalTools !== 1 ? "s" : ""}${c.reset}`, mainLine.length));
+
+  if (duplicateSlugs.length > 0) {
+    const t = `${duplicateSlugs.length} duplicates detected`;
+    console.log(boxLine(`${c.yellow}${t}${c.reset}`, t.length));
+  }
+
+  if (outdatedSlugs.length > 0) {
+    const t = `${outdatedSlugs.length} outdated versions`;
+    console.log(boxLine(`${c.red}${t}${c.reset}`, t.length));
+  }
+
+  if (notSyncedCount > 0 && totalTools > 1) {
+    const t = `${notSyncedCount} skills only in 1 location`;
+    console.log(boxLine(`${t}`, t.length));
+  }
+
+  if (weeklyMinutes > 0) {
+    const t = `~${weeklyMinutes} min/week spent on manual sync`;
+    console.log(boxLine(`${c.dim}${t}${c.reset}`, t.length));
+  }
+
+  console.log(`  ${c.dim}└${"─".repeat(BOX_W)}┘${c.reset}`);
+
+  // ── Detail breakdown ──
+  if (duplicateSlugs.length > 0) {
+    console.log(`\n  ${c.yellow}Duplicates:${c.reset}`);
+    for (const slug of duplicateSlugs.slice(0, 8)) {
+      const locs = slugLocations.get(slug);
+      const dirs = locs.map(l => l.dir.replace(HOME, "~").replace(/.*\/\./, "~/.")).join(", ");
+      const hashes = new Set(locs.map(l => l.hash));
+      const marker = hashes.size > 1 ? `${c.red}different versions${c.reset}` : `${c.dim}identical${c.reset}`;
+      console.log(`    ${slug} ${c.dim}→${c.reset} ${dirs} ${c.dim}(${c.reset}${marker}${c.dim})${c.reset}`);
+    }
+    if (duplicateSlugs.length > 8) {
+      console.log(`    ${c.dim}...and ${duplicateSlugs.length - 8} more${c.reset}`);
+    }
+  }
+
+  // ── Recommendation ──
+  console.log();
+  if (duplicateSlugs.length > 0 || totalTools > 1) {
+    console.log(`  ${c.green}Fix this?${c.reset} Run: ${c.cyan}npx praxl-cli@latest connect${c.reset}`);
+    console.log(`  ${c.dim}Auto-imports, deduplicates, and keeps everything in sync.${c.reset}`);
+  } else {
+    console.log(`  ${c.green}Manage your skills in the cloud:${c.reset} ${c.cyan}npx praxl-cli@latest connect${c.reset}`);
+    console.log(`  ${c.dim}Version control, AI review, deploy to more tools.${c.reset}`);
+  }
+  console.log(`  ${c.dim}Learn more: https://praxl.app${c.reset}`);
+  console.log();
 }
 
 // ─── Commands ───────────────────────────────────────────────────────────────
@@ -359,7 +609,12 @@ async function cmdConnect(args) {
 
   // Auto-login if no token
   if (!token) {
-    console.log(`  No token found. Get yours at: ${url}/settings\n`);
+    const signupUrl = `${url}/sign-up`;
+    console.log(`  No account yet? Opening browser to sign up...\n`);
+    openBrowser(signupUrl);
+    console.log(`  ${signupUrl}`);
+    console.log(`\n  After signing up, go to Settings to copy your CLI token.`);
+    console.log(`  (${url}/settings)\n`);
     token = await prompt("  Paste your token: ");
     if (!token) { console.log("  ✗ Token required.\n"); process.exit(1); }
   }
@@ -640,7 +895,8 @@ function showHelp() {
   Praxl CLI v${VERSION} — Sync AI skills to your local tools
 
   COMMANDS
-    praxl-cli connect            Connect & sync (recommended — one command)
+    praxl-cli scan               Scan local skills (no signup needed)
+    praxl-cli connect            Connect & sync (recommended)
     praxl-cli login              Save your auth token
     praxl-cli sync               One-time download
     praxl-cli sync --watch       Watch mode (poll every 30s)
@@ -653,9 +909,9 @@ function showHelp() {
     --interval SEC            Sync interval in seconds (default: 15)
 
   EXAMPLES
-    npx praxl-cli connect
-    npx praxl-cli connect --token YOUR_TOKEN
-    npx praxl-cli import --path ~/.cursor/skills
+    npx praxl-cli@latest scan
+    npx praxl-cli@latest connect
+    npx praxl-cli@latest import --path ~/.cursor/skills
 
   Get your token at: ${DEFAULT_URL}/settings
 `);
@@ -667,6 +923,8 @@ const args = parseArgs(process.argv.slice(2));
 
 if (args._cmd === "help" || args._cmd === "--help" || args._cmd === "-h") {
   showHelp();
+} else if (args._cmd === "scan") {
+  cmdScan().catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "connect") {
   cmdConnect(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "login") {
