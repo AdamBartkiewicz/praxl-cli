@@ -402,6 +402,26 @@ async function cmdConnect(args) {
     console.log(`  [${ts}] ${msg}`);
   };
 
+  // ── Fetch assignments (which skills → which platforms) ──
+  let skillAssignments = {}; // platform → [slugs]
+  let hasAssignments = false;
+
+  async function fetchAssignments() {
+    try {
+      const res = await api("/api/cli/assignments", token, url);
+      if (res.ok) {
+        const data = await res.json();
+        skillAssignments = data.assignments || {};
+        hasAssignments = data.hasAssignments || false;
+      }
+    } catch {}
+  }
+
+  function isSkillAssignedToPlatform(slug, platform) {
+    if (!hasAssignments) return true; // No assignments configured = sync everything
+    return skillAssignments[platform]?.includes(slug) || false;
+  }
+
   // ── Cloud → Local sync ──
   async function pullFromCloud(incremental = false) {
     const since = incremental ? (() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")).lastSync; } catch { return null; } })() : null;
@@ -413,6 +433,8 @@ async function cmdConnect(args) {
     for (const skill of result.skills) {
       if (!skill.isActive) continue;
       for (const platform of syncPlatforms) {
+        // Only sync if assigned (or no assignments = sync all)
+        if (!isSkillAssignedToPlatform(skill.slug, platform)) continue;
         const base = platformPaths[platform] || path.join(HOME, `.${platform}/skills`);
         if (writeSkill(base, skill.slug, skill.content, skill.files)) synced++;
       }
@@ -547,16 +569,23 @@ async function cmdConnect(args) {
   }
 
   // ── Initial sync ──
-  log("Pulling skills from cloud...");
+  log("Fetching assignments & skills...");
   try {
-    // Get cloud skill list first
+    await fetchAssignments();
+    if (hasAssignments) {
+      const assigned = Object.values(skillAssignments).flat();
+      log(`Assignments: ${[...new Set(assigned)].length} skills mapped to platforms`);
+    } else {
+      log("No assignments configured — syncing all skills to all platforms");
+    }
+    // Get cloud skill list
     const listRes = await api("/api/cli/sync", token, url);
     if (listRes.ok) {
       const listData = await listRes.json();
       listData.skills.forEach(s => cloudSlugs.add(s.slug));
     }
     const r = await pullFromCloud(false);
-    log(`✓ ${r.total} skills synced to local folders`);
+    log(`✓ ${r.synced} files synced (${r.total} skills total)`);
     await heartbeat(r.total);
   } catch (e) { log(`✗ ${e.message}`); }
 
@@ -568,6 +597,9 @@ async function cmdConnect(args) {
   let lastSkillCount = 0;
   setInterval(async () => {
     try {
+      // 0. Refresh assignments (user may change in web app)
+      await fetchAssignments();
+
       // 1. Check for local changes → push to cloud
       const localChanges = scanLocalChanges();
       if (localChanges.length > 0) {
@@ -579,11 +611,10 @@ async function cmdConnect(args) {
       if (r.total > 0) {
         log(`↓ Pulled ${r.synced} updated files`);
         lastSkillCount = r.total;
-        // Re-scan hashes after pull to avoid false push-back
         scanLocalChanges();
       }
 
-      // 3. Heartbeat
+      // 3. Heartbeat + report local state
       await heartbeat(lastSkillCount);
     } catch (e) { /* silent */ }
   }, interval * 1000);
