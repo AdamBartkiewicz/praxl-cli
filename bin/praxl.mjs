@@ -234,14 +234,48 @@ async function cmdSync(args) {
     log(`Polling every ${interval}s — Ctrl+C to stop\n`);
   }
 
-  // Initial full sync
-  try { const r = await doSync(false); log(`Initial: ${r.synced} files (${r.total} skills)`); } catch (e) { log(`✗ ${e.message}`); }
+  // Send heartbeat
+  async function sendHeartbeat(skillCount = 0) {
+    try {
+      const res = await api("/api/cli/heartbeat", token, url, {
+        method: "POST",
+        body: JSON.stringify({
+          platforms: syncPlatforms,
+          hostname: os.hostname(),
+          mode,
+          skillCount,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        // Check if web app triggered a sync
+        if (data.command?.action === "sync") {
+          log("⚡ Sync triggered from web app");
+          const r = await doSync(false);
+          log(`✓ Synced ${r.synced} files (${r.total} skills)`);
+        }
+      }
+    } catch {}
+  }
 
-  // Poll
+  // Initial full sync
+  let lastSkillCount = 0;
+  try {
+    const r = await doSync(false);
+    lastSkillCount = r.total;
+    log(`Initial: ${r.synced} files (${r.total} skills)`);
+    await sendHeartbeat(r.total);
+  } catch (e) { log(`✗ ${e.message}`); }
+
+  // Poll + heartbeat
   setInterval(async () => {
     try {
+      await sendHeartbeat(lastSkillCount);
       const r = await doSync(true);
-      if (r.total > 0) log(`↻ Updated ${r.synced} files (${r.total} changed)`);
+      if (r.total > 0) {
+        log(`↻ Updated ${r.synced} files (${r.total} changed)`);
+        lastSkillCount += r.total;
+      }
     } catch (e) { log(`✗ ${e.message}`); }
   }, interval * 1000);
 }
