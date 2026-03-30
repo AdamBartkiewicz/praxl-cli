@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { exec } from "child_process";
 
-const VERSION = "2.1.1";
+const VERSION = "3.0.0";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
 const TOKEN_FILE = path.join(CONFIG_DIR, "token");
@@ -207,22 +207,21 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function cmdScan() {
-  const c = {
-    reset: "\x1b[0m",
-    dim: "\x1b[2m",
-    bold: "\x1b[1m",
-    green: "\x1b[32m",
-    yellow: "\x1b[33m",
-    red: "\x1b[31m",
-    cyan: "\x1b[36m",
-    white: "\x1b[97m",
+async function cmdScan(args) {
+  const useAi = args.ai || false;
+  const jsonOutput = args.json || false;
+  const c = jsonOutput ? { reset:"",dim:"",bold:"",green:"",yellow:"",red:"",cyan:"",white:"" } : {
+    reset: "\x1b[0m", dim: "\x1b[2m", bold: "\x1b[1m",
+    green: "\x1b[32m", yellow: "\x1b[33m", red: "\x1b[31m",
+    cyan: "\x1b[36m", white: "\x1b[97m",
   };
 
-  console.log();
+  const { scoreSkillOffline, securityScan } = await import("../lib/quality.mjs");
 
-  // Map unique dirs to their platform labels (for display)
-  const dirToPlatforms = new Map(); // resolved dir → [platform names]
+  if (!jsonOutput) console.log();
+
+  // Map dirs to platforms
+  const dirToPlatforms = new Map();
   for (const [platform, dirs] of Object.entries(SCAN_PATHS)) {
     for (const dir of dirs) {
       const resolved = path.resolve(dir);
@@ -232,16 +231,16 @@ async function cmdScan() {
     }
   }
 
-  // Scan each unique directory once
-  // Track: dirKey → [{ slug, hash, content }]
-  const scannedDirs = []; // { resolvedDir, platforms, skills: [{ slug, hash }] }
+  // Scan directories, collect full content for scoring
+  const allSkills = []; // { slug, content, hash, platforms, dir }
+  const scannedDirs = [];
 
   for (const [resolvedDir, platforms] of dirToPlatforms) {
     if (!fs.existsSync(resolvedDir)) continue;
     let entries;
     try { entries = fs.readdirSync(resolvedDir); } catch { continue; }
 
-    const skills = [];
+    const dirSkills = [];
     for (const entry of entries) {
       const skillMd = path.join(resolvedDir, entry, "SKILL.md");
       const singleFile = path.join(resolvedDir, entry);
@@ -260,119 +259,156 @@ async function cmdScan() {
       if (content) {
         let h = 0;
         for (let i = 0; i < content.length; i++) h = ((h << 5) - h + content.charCodeAt(i)) | 0;
-        skills.push({ slug, hash: h });
+        dirSkills.push({ slug, content, hash: h });
       }
     }
 
-    if (skills.length > 0) {
-      scannedDirs.push({ resolvedDir, platforms, skills });
-      const displayDir = resolvedDir.replace(HOME, "~");
-      process.stdout.write(`  Scanning ${c.dim}${displayDir.padEnd(30)}${c.reset} found ${c.bold}${skills.length} skills${c.reset}\n`);
-      await sleep(150);
+    if (dirSkills.length > 0) {
+      scannedDirs.push({ resolvedDir, platforms, skills: dirSkills });
+      if (!jsonOutput) {
+        const displayDir = resolvedDir.replace(HOME, "~");
+        process.stdout.write(`  Scanning ${c.dim}${displayDir.padEnd(30)}${c.reset} found ${c.bold}${dirSkills.length} skills${c.reset}\n`);
+      }
     }
   }
 
-  // Count unique skills across all scanned dirs
-  // A slug in dir A and dir B = duplicate (exists in 2 locations)
-  const slugLocations = new Map(); // slug → [{ dir, platforms, hash }]
+  // Deduplicate by slug (keep first occurrence, track all platforms)
+  const slugMap = new Map(); // slug → { content, hash, platforms: Set, dirs: [] }
   for (const { resolvedDir, platforms, skills } of scannedDirs) {
     for (const s of skills) {
-      if (!slugLocations.has(s.slug)) slugLocations.set(s.slug, []);
-      slugLocations.get(s.slug).push({ dir: resolvedDir, platforms, hash: s.hash });
+      if (!slugMap.has(s.slug)) {
+        slugMap.set(s.slug, { content: s.content, hash: s.hash, platforms: new Set(), dirs: [], hashes: new Set() });
+      }
+      const entry = slugMap.get(s.slug);
+      platforms.forEach(p => entry.platforms.add(p));
+      entry.dirs.push(resolvedDir);
+      entry.hashes.add(s.hash);
     }
   }
 
-  const uniqueSlugs = slugLocations.size;
-  const totalLocations = [...slugLocations.values()].reduce((sum, locs) => sum + locs.length, 0);
-  const totalTools = scannedDirs.length;
-
-  if (uniqueSlugs === 0) {
-    console.log(`\n  ${c.dim}No skills found on this machine.${c.reset}`);
-    console.log(`\n  Create your first skill:`);
-    console.log(`  ${c.cyan}mkdir -p ~/.claude/skills/my-skill${c.reset}`);
-    console.log(`  Then create a SKILL.md inside it.`);
-    console.log(`\n  Learn more: ${c.cyan}https://praxl.app${c.reset}\n`);
+  if (slugMap.size === 0) {
+    if (jsonOutput) { console.log(JSON.stringify({ skills: [], summary: {} })); return; }
+    console.log(`\n  ${c.dim}No skills found.${c.reset}\n`);
     return;
   }
 
-  // Analyze duplicates & outdated
-  const duplicateSlugs = []; // slugs that exist in 2+ directories
-  const outdatedSlugs = []; // duplicates with different content
-  let notSyncedCount = 0; // slugs only in 1 directory
+  // Score and scan each unique skill
+  const results = [];
+  for (const [slug, data] of slugMap) {
+    const quality = scoreSkillOffline(data.content);
+    const security = securityScan(data.content);
+    results.push({
+      slug,
+      score: quality.score,
+      breakdown: quality.breakdown,
+      security,
+      platforms: [...data.platforms],
+      dirs: data.dirs,
+      isDuplicate: data.dirs.length > 1,
+      hasVersionConflict: data.hashes.size > 1,
+    });
+  }
 
-  for (const [slug, locs] of slugLocations) {
-    if (locs.length > 1) {
-      duplicateSlugs.push(slug);
-      const hashes = new Set(locs.map(l => l.hash));
-      if (hashes.size > 1) outdatedSlugs.push(slug);
-    } else {
-      notSyncedCount++;
+  // AI review (optional)
+  let aiResults = null;
+  if (useAi && !jsonOutput) {
+    try {
+      const { reviewSkillsWithAI } = await import("../lib/ai-review.mjs");
+      console.log(`\n  ${c.cyan}Running AI review...${c.reset}`);
+
+      const skillsForAi = results.map(r => ({ name: r.slug, content: slugMap.get(r.slug).content }));
+      const aiRes = await reviewSkillsWithAI(skillsForAi);
+
+      if (aiRes && Array.isArray(aiRes)) {
+        aiResults = new Map();
+        for (const r of aiRes) aiResults.set(r.name, r);
+        console.log(`  ${c.green}✓${c.reset} AI reviewed ${aiRes.length} skills\n`);
+      } else if (aiRes?.error === "rate_limit") {
+        console.log(`  ${c.yellow}⚠${c.reset} ${aiRes.message}\n`);
+      } else {
+        console.log(`  ${c.yellow}⚠${c.reset} AI unavailable, using offline scoring\n`);
+      }
+    } catch {
+      console.log(`  ${c.yellow}⚠${c.reset} AI review failed, using offline scoring\n`);
     }
   }
 
-  // Estimate: ~2 min per skill per extra location, ~1.5 updates/week
-  const weeklyMinutes = totalTools > 1 ? Math.round(uniqueSlugs * (totalTools - 1) * 2 * 1.5 / totalTools) : 0;
+  // ── JSON output ──
+  if (jsonOutput) {
+    const jsonData = {
+      skills: results.map(r => ({
+        slug: r.slug,
+        score: aiResults?.get(r.slug)?.score ?? r.score,
+        offlineScore: r.score,
+        aiScore: aiResults?.get(r.slug)?.score ?? null,
+        aiIssues: aiResults?.get(r.slug)?.issues ?? null,
+        security: { safe: r.security.safe, criticalCount: r.security.criticalCount, warningCount: r.security.warningCount, flags: r.security.flags },
+        platforms: r.platforms,
+        isDuplicate: r.isDuplicate,
+        hasVersionConflict: r.hasVersionConflict,
+      })),
+      summary: {
+        total: results.length,
+        averageScore: Math.round(results.reduce((s, r) => s + r.score, 0) / results.length * 10) / 10,
+        safe: results.filter(r => r.security.safe).length,
+        warnings: results.filter(r => r.security.warningCount > 0).length,
+        critical: results.filter(r => r.security.criticalCount > 0).length,
+        duplicates: results.filter(r => r.isDuplicate).length,
+      },
+    };
+    console.log(JSON.stringify(jsonData, null, 2));
+    return;
+  }
 
-  // ── Summary box ──
-  // Use a simple function to pad lines inside the box
-  const BOX_W = 45;
-  const boxLine = (text, rawLen) => {
-    const pad = Math.max(1, BOX_W - rawLen - 2);
-    return `  ${c.dim}|${c.reset}  ${text}${" ".repeat(pad)}${c.dim}|${c.reset}`;
-  };
+  // ── Quality report ──
+  const sorted = [...results].sort((a, b) => b.score - a.score);
+  const avgScore = Math.round(results.reduce((s, r) => s + r.score, 0) / results.length * 10) / 10;
+  const safeCount = results.filter(r => r.security.safe).length;
+  const warnCount = results.filter(r => r.security.warningCount > 0 && r.security.criticalCount === 0).length;
+  const critCount = results.filter(r => r.security.criticalCount > 0).length;
 
+  console.log(`\n  ${c.bold}Quality Report${c.reset}\n`);
+  console.log(`  ${"Skill".padEnd(28)} ${"Score".padEnd(8)} ${"Security".padEnd(12)} Platforms`);
+  console.log(`  ${c.dim}${"─".repeat(28)} ${"─".repeat(8)} ${"─".repeat(12)} ${"─".repeat(20)}${c.reset}`);
+
+  for (const r of sorted) {
+    const displayScore = aiResults?.get(r.slug)?.score ?? r.score;
+    const scoreColor = displayScore >= 4 ? c.green : displayScore >= 2.5 ? c.yellow : c.red;
+    const secLabel = r.security.criticalCount > 0
+      ? `${c.red}✗ ${r.security.criticalCount} flag${r.security.criticalCount > 1 ? "s" : ""}${c.reset}`
+      : r.security.warningCount > 0
+      ? `${c.yellow}⚠ ${r.security.warningCount} warn${c.reset}`
+      : `${c.green}✓ safe${c.reset}`;
+    const platforms = r.platforms.slice(0, 3).join(", ") + (r.platforms.length > 3 ? "..." : "");
+
+    console.log(`  ${r.slug.padEnd(28).slice(0, 28)} ${scoreColor}${String(displayScore).padEnd(4)}${c.reset}/5   ${secLabel.padEnd(22)} ${c.dim}${platforms}${c.reset}`);
+  }
+
+  console.log(`\n  Average: ${c.bold}${avgScore}/5${c.reset}  |  ${c.green}${safeCount} safe${c.reset}  ${warnCount > 0 ? `${c.yellow}${warnCount} warnings${c.reset}  ` : ""}${critCount > 0 ? `${c.red}${critCount} critical${c.reset}` : ""}`);
+
+  // ── Security alerts ──
+  const criticals = results.filter(r => r.security.criticalCount > 0);
+  if (criticals.length > 0) {
+    console.log(`\n  ${c.red}${c.bold}Security flags:${c.reset}`);
+    for (const r of criticals) {
+      for (const f of r.security.flags.filter(f => f.severity === "critical")) {
+        console.log(`    ${c.red}✗${c.reset} ${r.slug}:${f.line} ${c.dim}${f.risk}${c.reset} ${c.dim}(${f.context})${c.reset}`);
+      }
+    }
+  }
+
+  // ── Duplicates ──
+  const duplicates = results.filter(r => r.isDuplicate);
+  if (duplicates.length > 0) {
+    console.log(`\n  ${c.yellow}Duplicates:${c.reset} ${duplicates.length} skill${duplicates.length > 1 ? "s" : ""} in multiple locations`);
+  }
+
+  // ── Next steps ──
   console.log();
-  console.log(`  ${c.dim}┌${"─".repeat(BOX_W)}┐${c.reset}`);
-
-  const mainLine = `${uniqueSlugs} skills across ${totalTools} location${totalTools !== 1 ? "s" : ""}`;
-  console.log(boxLine(`${c.bold}${c.white}${uniqueSlugs} skills${c.reset} across ${c.bold}${totalTools} location${totalTools !== 1 ? "s" : ""}${c.reset}`, mainLine.length));
-
-  if (duplicateSlugs.length > 0) {
-    const t = `${duplicateSlugs.length} duplicates detected`;
-    console.log(boxLine(`${c.yellow}${t}${c.reset}`, t.length));
+  if (!useAi) {
+    console.log(`  ${c.cyan}npx praxl-cli@latest scan --ai${c.reset}    ${c.dim}AI-powered deep review${c.reset}`);
   }
-
-  if (outdatedSlugs.length > 0) {
-    const t = `${outdatedSlugs.length} outdated versions`;
-    console.log(boxLine(`${c.red}${t}${c.reset}`, t.length));
-  }
-
-  if (notSyncedCount > 0 && totalTools > 1) {
-    const t = `${notSyncedCount} skills only in 1 location`;
-    console.log(boxLine(`${t}`, t.length));
-  }
-
-  if (weeklyMinutes > 0) {
-    const t = `~${weeklyMinutes} min/week spent on manual sync`;
-    console.log(boxLine(`${c.dim}${t}${c.reset}`, t.length));
-  }
-
-  console.log(`  ${c.dim}└${"─".repeat(BOX_W)}┘${c.reset}`);
-
-  // ── Detail breakdown ──
-  if (duplicateSlugs.length > 0) {
-    console.log(`\n  ${c.yellow}Duplicates:${c.reset}`);
-    for (const slug of duplicateSlugs.slice(0, 8)) {
-      const locs = slugLocations.get(slug);
-      const dirs = locs.map(l => l.dir.replace(HOME, "~").replace(/.*\/\./, "~/.")).join(", ");
-      const hashes = new Set(locs.map(l => l.hash));
-      const marker = hashes.size > 1 ? `${c.red}different versions${c.reset}` : `${c.dim}identical${c.reset}`;
-      console.log(`    ${slug} ${c.dim}→${c.reset} ${dirs} ${c.dim}(${c.reset}${marker}${c.dim})${c.reset}`);
-    }
-    if (duplicateSlugs.length > 8) {
-      console.log(`    ${c.dim}...and ${duplicateSlugs.length - 8} more${c.reset}`);
-    }
-  }
-
-  // ── Recommendation ──
-  console.log();
-  if (duplicateSlugs.length > 0 || totalTools > 1) {
-    console.log(`  ${c.green}Fix this?${c.reset} Run: ${c.cyan}npx praxl-cli@latest connect${c.reset}`);
-    console.log(`  ${c.dim}Auto-imports, deduplicates, and keeps everything in sync.${c.reset}`);
-  } else {
-    console.log(`  ${c.green}Manage your skills in the cloud:${c.reset} ${c.cyan}npx praxl-cli@latest connect${c.reset}`);
-    console.log(`  ${c.dim}Version control, AI review, deploy to more tools.${c.reset}`);
-  }
+  console.log(`  ${c.cyan}npx praxl-cli@latest connect${c.reset}       ${c.dim}Sync & manage in Praxl${c.reset}`);
   console.log(`  ${c.dim}Learn more: https://praxl.app${c.reset}`);
   console.log();
 }
@@ -884,6 +920,8 @@ function parseArgs(argv) {
     else if (a === "--interval" && argv[i+1]) { args.interval = argv[++i]; }
     else if (a === "--watch") { args.watch = true; }
     else if (a === "--daemon") { args.daemon = true; }
+    else if (a === "--ai") { args.ai = true; }
+    else if (a === "--json") { args.json = true; }
     else if (!a.startsWith("-")) { positional.push(a); }
   }
   args._cmd = positional[0] || "sync";
@@ -895,7 +933,9 @@ function showHelp() {
   Praxl CLI v${VERSION} — Sync AI skills to your local tools
 
   COMMANDS
-    praxl-cli scan               Scan local skills (no signup needed)
+    praxl-cli scan               Scan + quality score + security check
+    praxl-cli scan --ai          Deep AI review (needs internet)
+    praxl-cli scan --json        Machine-readable JSON output
     praxl-cli connect            Connect & sync (recommended)
     praxl-cli login              Save your auth token
     praxl-cli sync               One-time download
@@ -924,7 +964,7 @@ const args = parseArgs(process.argv.slice(2));
 if (args._cmd === "help" || args._cmd === "--help" || args._cmd === "-h") {
   showHelp();
 } else if (args._cmd === "scan") {
-  cmdScan().catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
+  cmdScan(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "connect") {
   cmdConnect(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "login") {
