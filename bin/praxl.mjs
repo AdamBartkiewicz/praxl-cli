@@ -562,6 +562,11 @@ async function cmdConnect(args) {
           const r = await pullFromCloud(false);
           log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
         }
+        if (data.command?.action === "disconnect") {
+          log("🔌 Disconnect signal received from web app");
+          log("Goodbye!\n");
+          process.exit(0);
+        }
       }
       // Also report local state periodically
       await reportLocalState();
