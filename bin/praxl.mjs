@@ -433,10 +433,14 @@ async function cmdConnect(args) {
     for (const skill of result.skills) {
       if (!skill.isActive) continue;
       for (const platform of syncPlatforms) {
-        // Only sync if assigned (or no assignments = sync all)
         if (!isSkillAssignedToPlatform(skill.slug, platform)) continue;
         const base = platformPaths[platform] || path.join(HOME, `.${platform}/skills`);
-        if (writeSkill(base, skill.slug, skill.content, skill.files)) synced++;
+        if (writeSkill(base, skill.slug, skill.content, skill.files)) {
+          synced++;
+          // Remember what we wrote so we don't create change request for our own writes
+          deployedHashes.set(skill.slug, hashContent(skill.content));
+          localHashes.set(skill.slug, hashContent(skill.content));
+        }
       }
     }
     ensureConfigDir();
@@ -483,50 +487,36 @@ async function cmdConnect(args) {
     return [...changes, ...newSkills];
   }
 
-  async function pushToCloud(changes) {
-    // Collect all skills to import (new + changed)
-    const toImport = [];
-    for (const change of changes) {
-      const descMatch = change.content.match(/^description:\s*(.+)$/m);
-      const description = descMatch?.[1]?.trim().replace(/^["']|["']$/g, "") || "";
-      const displayName = change.slug.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+  // Store deployed content hashes to detect real changes vs our own writes
+  const deployedHashes = new Map();
 
-      // Collect reference files
-      const files = [];
-      for (const folder of ["references", "scripts", "assets"]) {
-        const sub = path.join(change.dir, change.slug, folder);
-        if (!fs.existsSync(sub)) continue;
-        for (const fn of fs.readdirSync(sub)) {
-          if (!fs.statSync(path.join(sub, fn)).isFile()) continue;
-          files.push({ folder, filename: fn, content: fs.readFileSync(path.join(sub, fn), "utf-8"), mimeType: "text/plain", size: fs.statSync(path.join(sub, fn)).size });
-        }
-      }
+  async function submitChangeRequests(changes) {
+    const changeRequests = changes.map(c => {
+      // Find what the deployed content was (to include as oldContent)
+      const deployedHash = deployedHashes.get(c.slug);
+      return {
+        slug: c.slug,
+        platform: syncPlatforms[0] || "unknown",
+        oldContent: null, // server will compare
+        newContent: c.content,
+      };
+    });
 
-      toImport.push({ slug: change.slug, name: displayName, description: description.slice(0, 500), content: change.content, files });
-    }
-
-    if (toImport.length === 0) return;
+    if (changeRequests.length === 0) return;
 
     try {
-      const importRes = await api("/api/cli/import", token, url, {
+      const res = await api("/api/cli/change-request", token, url, {
         method: "POST",
-        body: JSON.stringify({ skills: toImport }),
+        body: JSON.stringify({ changes: changeRequests }),
       });
-      if (importRes.ok) {
-        const result = await importRes.json();
-        if (result.imported > 0) {
-          log(`⬆ Pushed ${result.imported} skill(s) to cloud`);
-          toImport.forEach(s => cloudSlugs.add(s.slug));
-        }
-        if (result.skipped > 0) {
-          // Skills already exist — they were changed locally, try update
-          for (const change of changes.filter(c => c.type === "changed")) {
-            log(`⬆ Local change: ${change.slug} (edit in Praxl to update cloud version)`);
-          }
+      if (res.ok) {
+        const result = await res.json();
+        if (result.created > 0) {
+          log(`📋 ${result.created} change request(s) submitted — review in Praxl web app`);
         }
       }
     } catch (e) {
-      log(`✗ Push failed: ${e.message}`);
+      log(`✗ Failed to submit changes: ${e.message}`);
     }
   }
 
@@ -605,10 +595,10 @@ async function cmdConnect(args) {
       // 0. Refresh assignments (user may change in web app)
       await fetchAssignments();
 
-      // 1. Check for local changes → push to cloud
+      // 1. Check for local changes → submit as change requests
       const localChanges = scanLocalChanges();
       if (localChanges.length > 0) {
-        await pushToCloud(localChanges);
+        await submitChangeRequests(localChanges);
       }
 
       // 2. Check for cloud changes → pull to local
