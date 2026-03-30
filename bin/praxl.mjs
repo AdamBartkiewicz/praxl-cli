@@ -509,6 +509,24 @@ async function cmdConnect(args) {
   }
 
   // ── Heartbeat ──
+  // Report local file state to cloud
+  async function reportLocalState() {
+    const localSkills = [];
+    for (const platform of syncPlatforms) {
+      const dir = platformPaths[platform] || path.join(HOME, `.${platform}/skills`);
+      if (!fs.existsSync(dir)) continue;
+      for (const slug of fs.readdirSync(dir)) {
+        const skillMd = path.join(dir, slug, "SKILL.md");
+        if (!fs.existsSync(skillMd)) continue;
+        const stat = fs.statSync(skillMd);
+        localSkills.push({ platform, slug, localPath: path.join(dir, slug), sizeBytes: stat.size, lastModified: stat.mtime.toISOString() });
+      }
+    }
+    try {
+      await api("/api/cli/report-local", token, url, { method: "POST", body: JSON.stringify({ skills: localSkills }) });
+    } catch {}
+  }
+
   async function heartbeat(skillCount) {
     try {
       const res = await api("/api/cli/heartbeat", token, url, {
@@ -523,6 +541,8 @@ async function cmdConnect(args) {
           log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
         }
       }
+      // Also report local state periodically
+      await reportLocalState();
     } catch {}
   }
 
