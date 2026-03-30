@@ -418,7 +418,7 @@ async function cmdConnect(args) {
   }
 
   function isSkillAssignedToPlatform(slug, platform) {
-    if (!hasAssignments) return true; // No assignments configured = sync everything
+    // Only sync skills that are explicitly assigned to this platform
     return skillAssignments[platform]?.includes(slug) || false;
   }
 
