@@ -1,0 +1,19 @@
+{
+  "name": "praxl",
+  "version": "1.0.0",
+  "description": "Praxl CLI — sync AI skills to your local tools",
+  "bin": {
+    "praxl": "./bin/praxl.mjs",
+    "praxl-sync": "./bin/praxl.mjs",
+    "praxl-import": "./bin/praxl.mjs"
+  },
+  "type": "module",
+  "keywords": ["ai", "skills", "claude", "cursor", "codex", "sync", "deploy", "praxl"],
+  "author": "Praxl",
+  "license": "MIT",
+  "homepage": "https://praxl.app",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AdamBartkiewicz/praxl-cli"
+  }
+}
