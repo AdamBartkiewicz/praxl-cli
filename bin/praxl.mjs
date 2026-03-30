@@ -177,7 +177,27 @@ async function cmdSync(args) {
   const data = await verifyToken(token, url);
   if (!data) { log("✗ Invalid token. Run: npx praxl login"); process.exit(1); }
   log(`Authenticated as ${data.user?.name || data.user?.email}`);
-  log(`Targets: ${platforms.join(", ")}`);
+
+  // Fetch platform config from Praxl (unless --platforms was explicitly passed)
+  let syncPlatforms = platforms;
+  if (!args.platforms) {
+    try {
+      const configRes = await api("/api/cli/config", token, url);
+      if (configRes.ok) {
+        const config = await configRes.json();
+        const activeTargets = config.targets?.filter(t => t.isActive) || [];
+        if (activeTargets.length > 0) {
+          syncPlatforms = activeTargets.map(t => t.platform);
+          log(`Platforms from config: ${activeTargets.map(t => `${t.label} (${t.basePath})`).join(", ")}`);
+          // Override PLATFORM_PATHS with custom paths from config
+          for (const t of activeTargets) {
+            if (t.basePath) PLATFORM_PATHS[t.platform] = t.basePath.replace(/^~/, HOME);
+          }
+        }
+      }
+    } catch {}
+  }
+  log(`Targets: ${syncPlatforms.join(", ")}`);
 
   async function doSync(incremental = false) {
     const since = incremental ? (() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")).lastSync; } catch { return null; } })() : null;
@@ -188,7 +208,7 @@ async function cmdSync(args) {
     let synced = 0;
     for (const skill of result.skills) {
       if (!skill.isActive) continue;
-      for (const platform of platforms) {
+      for (const platform of syncPlatforms) {
         const base = PLATFORM_PATHS[platform] || path.join(HOME, `.${platform}/skills`);
         if (writeSkill(base, skill.slug, skill.content, skill.files)) synced++;
       }
