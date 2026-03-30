@@ -346,6 +346,200 @@ async function cmdStatus(args) {
   console.log();
 }
 
+// ─── Connect: one command for everything ────────────────────────────────────
+
+async function cmdConnect(args) {
+  let token = args.token || getToken();
+  const url = args.url || getUrl();
+  const interval = parseInt(args.interval) || 15;
+
+  console.log(`\n  ╔═══════════════════════════════════════╗`);
+  console.log(`  ║  Praxl Connect                         ║`);
+  console.log(`  ╚═══════════════════════════════════════╝\n`);
+
+  // Auto-login if no token
+  if (!token) {
+    console.log(`  No token found. Get yours at: ${url}/settings\n`);
+    token = await prompt("  Paste your token: ");
+    if (!token) { console.log("  ✗ Token required.\n"); process.exit(1); }
+  }
+
+  // Verify
+  const data = await verifyToken(token, url);
+  if (!data) { console.log("  ✗ Invalid token.\n"); process.exit(1); }
+
+  saveToken(token);
+  saveConfig({ ...loadConfig(), url });
+
+  const userName = data.user?.name || data.user?.email || "unknown";
+  console.log(`  ✓ Connected as ${userName}\n`);
+
+  // Fetch platform config
+  let syncPlatforms = ["claude-code"];
+  let platformPaths = { ...PLATFORM_PATHS };
+  try {
+    const configRes = await api("/api/cli/config", token, url);
+    if (configRes.ok) {
+      const config = await configRes.json();
+      const active = config.targets?.filter(t => t.isActive) || [];
+      if (active.length > 0) {
+        syncPlatforms = active.map(t => t.platform);
+        for (const t of active) {
+          if (t.basePath) platformPaths[t.platform] = t.basePath.replace(/^~/, HOME);
+        }
+      }
+    }
+  } catch {}
+
+  const watchDirs = syncPlatforms.map(p => platformPaths[p] || path.join(HOME, `.${p}/skills`));
+  console.log(`  Platforms: ${syncPlatforms.join(", ")}`);
+  watchDirs.forEach(d => console.log(`  📁 ${d}`));
+  console.log(`  Polling: every ${interval}s (bidirectional)`);
+  console.log(`  Press Ctrl+C to disconnect\n`);
+
+  const log = (msg) => {
+    const ts = new Date().toISOString().slice(11, 19);
+    console.log(`  [${ts}] ${msg}`);
+  };
+
+  // ── Cloud → Local sync ──
+  async function pullFromCloud(incremental = false) {
+    const since = incremental ? (() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")).lastSync; } catch { return null; } })() : null;
+    const endpoint = `/api/cli/sync${since ? `?since=${encodeURIComponent(since)}` : ""}`;
+    const res = await api(endpoint, token, url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const result = await res.json();
+    let synced = 0;
+    for (const skill of result.skills) {
+      if (!skill.isActive) continue;
+      for (const platform of syncPlatforms) {
+        const base = platformPaths[platform] || path.join(HOME, `.${platform}/skills`);
+        if (writeSkill(base, skill.slug, skill.content, skill.files)) synced++;
+      }
+    }
+    ensureConfigDir();
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ lastSync: result.syncedAt }));
+    return { synced, total: result.skills.length };
+  }
+
+  // ── Local → Cloud sync ──
+  const localHashes = new Map(); // slug → content hash
+
+  function hashContent(content) {
+    let h = 0;
+    for (let i = 0; i < content.length; i++) { h = ((h << 5) - h + content.charCodeAt(i)) | 0; }
+    return h;
+  }
+
+  function scanLocalChanges() {
+    const changes = [];
+    for (const dir of watchDirs) {
+      if (!fs.existsSync(dir)) continue;
+      for (const slug of fs.readdirSync(dir)) {
+        const skillMd = path.join(dir, slug, "SKILL.md");
+        if (!fs.existsSync(skillMd)) continue;
+        const content = fs.readFileSync(skillMd, "utf-8");
+        const hash = hashContent(content);
+        const prev = localHashes.get(slug);
+        if (prev !== undefined && prev !== hash) {
+          changes.push({ slug, content, dir });
+        }
+        localHashes.set(slug, hash);
+      }
+    }
+    return changes;
+  }
+
+  async function pushToCloud(changes) {
+    for (const change of changes) {
+      try {
+        // Parse frontmatter for name/description
+        const fmMatch = change.content.match(/^---\n[\s\S]*?^name:\s*(.+)$/m);
+        const descMatch = change.content.match(/^description:\s*(.+)$/m);
+        const name = fmMatch?.[1]?.trim() || change.slug;
+        const description = descMatch?.[1]?.trim().replace(/^["']|["']$/g, "") || "";
+        const displayName = change.slug.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+
+        // Try to update existing skill first
+        const res = await api("/api/cli/sync", token, url);
+        if (!res.ok) continue;
+        const data = await res.json();
+        const existing = data.skills.find(s => s.slug === change.slug);
+
+        if (existing) {
+          // Update via import endpoint (will skip if unchanged)
+          // For now just log — full update API would be better
+          log(`⬆ Local change detected: ${change.slug} (push to cloud coming soon)`);
+        } else {
+          // New skill — import it
+          const importRes = await api("/api/cli/import", token, url, {
+            method: "POST",
+            body: JSON.stringify({ skills: [{ slug: change.slug, name: displayName, description, content: change.content, files: [] }] }),
+          });
+          if (importRes.ok) {
+            const result = await importRes.json();
+            if (result.imported > 0) log(`⬆ Pushed new local skill: ${change.slug}`);
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // ── Heartbeat ──
+  async function heartbeat(skillCount) {
+    try {
+      const res = await api("/api/cli/heartbeat", token, url, {
+        method: "POST",
+        body: JSON.stringify({ platforms: syncPlatforms, hostname: os.hostname(), mode: "connect", skillCount }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.command?.action === "sync") {
+          log("⚡ Sync triggered from web app");
+          const r = await pullFromCloud(false);
+          log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
+        }
+      }
+    } catch {}
+  }
+
+  // ── Initial sync ──
+  log("Pulling skills from cloud...");
+  try {
+    const r = await pullFromCloud(false);
+    log(`✓ ${r.total} skills synced to local folders`);
+    await heartbeat(r.total);
+  } catch (e) { log(`✗ ${e.message}`); }
+
+  // Initialize local hashes (for change detection)
+  scanLocalChanges();
+  log("Watching for local changes...\n");
+
+  // ── Poll loop ──
+  let lastSkillCount = 0;
+  setInterval(async () => {
+    try {
+      // 1. Check for local changes → push to cloud
+      const localChanges = scanLocalChanges();
+      if (localChanges.length > 0) {
+        await pushToCloud(localChanges);
+      }
+
+      // 2. Check for cloud changes → pull to local
+      const r = await pullFromCloud(true);
+      if (r.total > 0) {
+        log(`↓ Pulled ${r.synced} updated files`);
+        lastSkillCount = r.total;
+        // Re-scan hashes after pull to avoid false push-back
+        scanLocalChanges();
+      }
+
+      // 3. Heartbeat
+      await heartbeat(lastSkillCount);
+    } catch (e) { /* silent */ }
+  }, interval * 1000);
+}
+
 // ─── Parse args & dispatch ──────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -371,27 +565,22 @@ function showHelp() {
   Praxl CLI v${VERSION} — Sync AI skills to your local tools
 
   COMMANDS
-    praxl login               Save your auth token
-    praxl sync                Download all skills to local folders
-    praxl sync --watch        Watch mode (poll every 30s)
-    praxl sync --daemon       Background daemon
-    praxl import              Import local skills to Praxl cloud
-    praxl status              Show your skills
+    praxl-cli connect            Connect & sync (recommended — one command)
+    praxl-cli login              Save your auth token
+    praxl-cli sync               One-time download
+    praxl-cli sync --watch       Watch mode (poll every 30s)
+    praxl-cli import             Import local skills to Praxl cloud
+    praxl-cli status             Show your skills
 
   OPTIONS
-    --token TOKEN             Auth token (or run 'praxl login' first)
+    --token TOKEN             Auth token (auto-prompt if missing)
     --url URL                 Praxl instance (default: ${DEFAULT_URL})
-    --platforms a,b           Target platforms (default: claude-code)
-                              Options: claude-code, cursor, codex, copilot,
-                              windsurf, opencode, gemini-cli
-    --path DIR                Skills directory for import (default: ~/.claude/skills)
-    --interval SEC            Poll interval for watch/daemon (default: 30)
+    --interval SEC            Sync interval in seconds (default: 15)
 
   EXAMPLES
-    npx praxl login --token YOUR_TOKEN
-    npx praxl sync --platforms claude-code,cursor
-    npx praxl sync --watch --interval 15
-    npx praxl import --path ~/.cursor/skills
+    npx praxl-cli connect
+    npx praxl-cli connect --token YOUR_TOKEN
+    npx praxl-cli import --path ~/.cursor/skills
 
   Get your token at: ${DEFAULT_URL}/settings
 `);
@@ -403,6 +592,8 @@ const args = parseArgs(process.argv.slice(2));
 
 if (args._cmd === "help" || args._cmd === "--help" || args._cmd === "-h") {
   showHelp();
+} else if (args._cmd === "connect") {
+  cmdConnect(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "login") {
   cmdLogin(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "sync") {
@@ -414,6 +605,6 @@ if (args._cmd === "help" || args._cmd === "--help" || args._cmd === "-h") {
 } else if (args._cmd === "version" || args._cmd === "--version" || args._cmd === "-v") {
   console.log(`praxl v${VERSION}`);
 } else {
-  // Default: sync
-  cmdSync(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
+  // Default: connect (the main command)
+  cmdConnect(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 }

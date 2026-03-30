@@ -1,11 +1,9 @@
 {
-  "name": "praxl",
-  "version": "1.0.0",
+  "name": "praxl-cli",
+  "version": "1.1.0",
   "description": "Praxl CLI — sync AI skills to your local tools",
   "bin": {
-    "praxl": "./bin/praxl.mjs",
-    "praxl-sync": "./bin/praxl.mjs",
-    "praxl-import": "./bin/praxl.mjs"
+    "praxl": "bin/praxl.mjs"
   },
   "type": "module",
   "keywords": ["ai", "skills", "claude", "cursor", "codex", "sync", "deploy", "praxl"],
