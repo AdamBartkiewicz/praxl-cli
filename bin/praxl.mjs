@@ -431,8 +431,12 @@ async function cmdConnect(args) {
     return h;
   }
 
+  // Known cloud slugs (populated after initial pull)
+  const cloudSlugs = new Set();
+
   function scanLocalChanges() {
     const changes = [];
+    const newSkills = [];
     for (const dir of watchDirs) {
       if (!fs.existsSync(dir)) continue;
       for (const slug of fs.readdirSync(dir)) {
@@ -441,47 +445,66 @@ async function cmdConnect(args) {
         const content = fs.readFileSync(skillMd, "utf-8");
         const hash = hashContent(content);
         const prev = localHashes.get(slug);
-        if (prev !== undefined && prev !== hash) {
-          changes.push({ slug, content, dir });
+
+        if (prev === undefined) {
+          // First scan OR new local skill
+          if (localHashes.size > 0 && !cloudSlugs.has(slug)) {
+            // localHashes populated = not initial scan, and not in cloud = new local skill
+            newSkills.push({ slug, content, dir, type: "new" });
+          }
+        } else if (prev !== hash) {
+          changes.push({ slug, content, dir, type: "changed" });
         }
         localHashes.set(slug, hash);
       }
     }
-    return changes;
+    return [...changes, ...newSkills];
   }
 
   async function pushToCloud(changes) {
+    // Collect all skills to import (new + changed)
+    const toImport = [];
     for (const change of changes) {
-      try {
-        // Parse frontmatter for name/description
-        const fmMatch = change.content.match(/^---\n[\s\S]*?^name:\s*(.+)$/m);
-        const descMatch = change.content.match(/^description:\s*(.+)$/m);
-        const name = fmMatch?.[1]?.trim() || change.slug;
-        const description = descMatch?.[1]?.trim().replace(/^["']|["']$/g, "") || "";
-        const displayName = change.slug.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+      const descMatch = change.content.match(/^description:\s*(.+)$/m);
+      const description = descMatch?.[1]?.trim().replace(/^["']|["']$/g, "") || "";
+      const displayName = change.slug.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 
-        // Try to update existing skill first
-        const res = await api("/api/cli/sync", token, url);
-        if (!res.ok) continue;
-        const data = await res.json();
-        const existing = data.skills.find(s => s.slug === change.slug);
+      // Collect reference files
+      const files = [];
+      for (const folder of ["references", "scripts", "assets"]) {
+        const sub = path.join(change.dir, change.slug, folder);
+        if (!fs.existsSync(sub)) continue;
+        for (const fn of fs.readdirSync(sub)) {
+          if (!fs.statSync(path.join(sub, fn)).isFile()) continue;
+          files.push({ folder, filename: fn, content: fs.readFileSync(path.join(sub, fn), "utf-8"), mimeType: "text/plain", size: fs.statSync(path.join(sub, fn)).size });
+        }
+      }
 
-        if (existing) {
-          // Update via import endpoint (will skip if unchanged)
-          // For now just log — full update API would be better
-          log(`⬆ Local change detected: ${change.slug} (push to cloud coming soon)`);
-        } else {
-          // New skill — import it
-          const importRes = await api("/api/cli/import", token, url, {
-            method: "POST",
-            body: JSON.stringify({ skills: [{ slug: change.slug, name: displayName, description, content: change.content, files: [] }] }),
-          });
-          if (importRes.ok) {
-            const result = await importRes.json();
-            if (result.imported > 0) log(`⬆ Pushed new local skill: ${change.slug}`);
+      toImport.push({ slug: change.slug, name: displayName, description: description.slice(0, 500), content: change.content, files });
+    }
+
+    if (toImport.length === 0) return;
+
+    try {
+      const importRes = await api("/api/cli/import", token, url, {
+        method: "POST",
+        body: JSON.stringify({ skills: toImport }),
+      });
+      if (importRes.ok) {
+        const result = await importRes.json();
+        if (result.imported > 0) {
+          log(`⬆ Pushed ${result.imported} skill(s) to cloud`);
+          toImport.forEach(s => cloudSlugs.add(s.slug));
+        }
+        if (result.skipped > 0) {
+          // Skills already exist — they were changed locally, try update
+          for (const change of changes.filter(c => c.type === "changed")) {
+            log(`⬆ Local change: ${change.slug} (edit in Praxl to update cloud version)`);
           }
         }
-      } catch {}
+      }
+    } catch (e) {
+      log(`✗ Push failed: ${e.message}`);
     }
   }
 
@@ -506,14 +529,20 @@ async function cmdConnect(args) {
   // ── Initial sync ──
   log("Pulling skills from cloud...");
   try {
+    // Get cloud skill list first
+    const listRes = await api("/api/cli/sync", token, url);
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      listData.skills.forEach(s => cloudSlugs.add(s.slug));
+    }
     const r = await pullFromCloud(false);
     log(`✓ ${r.total} skills synced to local folders`);
     await heartbeat(r.total);
   } catch (e) { log(`✗ ${e.message}`); }
 
-  // Initialize local hashes (for change detection)
+  // Initialize local hashes (for change detection — won't trigger push on first scan)
   scanLocalChanges();
-  log("Watching for local changes...\n");
+  log("Watching for changes (bidirectional)...\n");
 
   // ── Poll loop ──
   let lastSkillCount = 0;
