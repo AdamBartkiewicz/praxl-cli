@@ -6,7 +6,8 @@ import os from "os";
 import readline from "readline";
 import { exec } from "child_process";
 
-const VERSION = "3.0.1";
+const VERSION = "1.0.0";
+const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
 const TOKEN_FILE = path.join(CONFIG_DIR, "token");
@@ -16,6 +17,24 @@ const LOG_FILE = path.join(CONFIG_DIR, "sync.log");
 const PID_FILE = path.join(CONFIG_DIR, "sync.pid");
 
 const DEFAULT_URL = "https://go.praxl.app";
+
+// ─── Auto-update check (non-blocking) ──────────────────────────────────────
+
+async function checkForUpdate() {
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${PKG_NAME}/latest`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return;
+    const data = await res.json();
+    const latest = data.version;
+    if (latest && latest !== VERSION) {
+      const c = { yellow: "\x1b[33m", cyan: "\x1b[36m", dim: "\x1b[2m", reset: "\x1b[0m" };
+      console.log(`\n  ${c.yellow}Update available: ${VERSION} → ${latest}${c.reset}`);
+      console.log(`  Run: ${c.cyan}npm install -g ${PKG_NAME}${c.reset}\n`);
+    }
+  } catch {
+    // Silent - don't block CLI usage
+  }
+}
 
 const PLATFORM_PATHS = {
   "claude-code": path.join(HOME, ".claude/skills"),
@@ -940,18 +959,21 @@ function parseArgs(argv) {
 
 function showHelp() {
   console.log(`
-  Praxl CLI v${VERSION} — Sync AI skills to your local tools
+  Praxl v${VERSION} — manage, sync, and deploy AI skills
+
+  INSTALL
+    npm install -g praxl-app
 
   COMMANDS
-    praxl-cli scan               Scan + quality score + security check
-    praxl-cli scan --ai          Deep AI review (needs internet)
-    praxl-cli scan --json        Machine-readable JSON output
-    praxl-cli connect            Connect & sync (recommended)
-    praxl-cli login              Save your auth token
-    praxl-cli sync               One-time download
-    praxl-cli sync --watch       Watch mode (poll every 30s)
-    praxl-cli import             Import local skills to Praxl cloud
-    praxl-cli status             Show your skills
+    praxl scan                  Scan + quality score + security check
+    praxl scan --ai             Deep AI review (needs internet)
+    praxl scan --json           Machine-readable JSON output
+    praxl connect               Connect & sync (recommended)
+    praxl login                 Save your auth token
+    praxl sync                  One-time download
+    praxl sync --watch          Watch mode (poll every 30s)
+    praxl import                Import local skills to Praxl cloud
+    praxl status                Show your skills
 
   OPTIONS
     --token TOKEN             Auth token (auto-prompt if missing)
@@ -959,9 +981,9 @@ function showHelp() {
     --interval SEC            Sync interval in seconds (default: 15)
 
   EXAMPLES
-    npx praxl-cli@latest scan
-    npx praxl-cli@latest connect
-    npx praxl-cli@latest import --path ~/.cursor/skills
+    praxl scan
+    praxl connect
+    praxl import --path ~/.cursor/skills
 
   Get your token at: ${DEFAULT_URL}/settings
 `);
@@ -974,7 +996,7 @@ const args = parseArgs(process.argv.slice(2));
 if (args._cmd === "help" || args._cmd === "--help" || args._cmd === "-h") {
   showHelp();
 } else if (args._cmd === "scan") {
-  cmdScan(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
+  cmdScan(args).then(() => checkForUpdate()).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "connect") {
   cmdConnect(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "login") {
@@ -984,9 +1006,10 @@ if (args._cmd === "help" || args._cmd === "--help" || args._cmd === "-h") {
 } else if (args._cmd === "import") {
   cmdImport(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "status") {
-  cmdStatus(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
+  cmdStatus(args).then(() => checkForUpdate()).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "version" || args._cmd === "--version" || args._cmd === "-v") {
   console.log(`praxl v${VERSION}`);
+  checkForUpdate();
 } else {
   // Default: connect (the main command)
   cmdConnect(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });

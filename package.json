@@ -1,7 +1,7 @@
 {
-  "name": "praxl-cli",
-  "version": "3.0.1",
-  "description": "Praxl CLI — sync AI skills to your local tools",
+  "name": "praxl-app",
+  "version": "1.0.0",
+  "description": "Praxl — manage, sync, and deploy AI skills",
   "bin": {
     "praxl": "bin/praxl.mjs"
   },
