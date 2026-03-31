@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { exec } from "child_process";
 
-const VERSION = "3.0.0";
+const VERSION = "3.0.1";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
 const TOKEN_FILE = path.join(CONFIG_DIR, "token");
@@ -713,6 +713,26 @@ async function cmdConnect(args) {
     return skillAssignments[platform]?.includes(slug) || false;
   }
 
+  // ── Hashing ──
+  function hashContent(content) {
+    let h = 0;
+    for (let i = 0; i < content.length; i++) { h = ((h << 5) - h + content.charCodeAt(i)) | 0; }
+    return h;
+  }
+
+  // Key: "platform:slug" - tracks per-platform to handle same skill in multiple dirs
+  const localHashes = new Map();    // "platform:slug" → hash
+  const deployedHashes = new Map(); // "platform:slug" → hash (what cloud wrote)
+  const cloudSlugs = new Set();
+  let initialScanDone = false;
+
+  // Map dir → platform name
+  const dirToPlatform = new Map();
+  for (const platform of syncPlatforms) {
+    const dir = platformPaths[platform] || path.join(HOME, `.${platform}/skills`);
+    dirToPlatform.set(dir, platform);
+  }
+
   // ── Cloud → Local sync ──
   async function pullFromCloud(incremental = false) {
     const since = incremental ? (() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")).lastSync; } catch { return null; } })() : null;
@@ -728,9 +748,11 @@ async function cmdConnect(args) {
         const base = platformPaths[platform] || path.join(HOME, `.${platform}/skills`);
         if (writeSkill(base, skill.slug, skill.content, skill.files)) {
           synced++;
-          // Remember what we wrote so we don't create change request for our own writes
-          deployedHashes.set(skill.slug, hashContent(skill.content));
-          localHashes.set(skill.slug, hashContent(skill.content));
+          const key = `${platform}:${skill.slug}`;
+          // Mark as deployed so we don't create change request for our own writes
+          const h = hashContent(skill.content);
+          deployedHashes.set(key, h);
+          localHashes.set(key, h);
         }
       }
     }
@@ -739,59 +761,46 @@ async function cmdConnect(args) {
     return { synced, total: result.skills.length };
   }
 
-  // ── Local → Cloud sync ──
-  const localHashes = new Map(); // slug → content hash
-
-  function hashContent(content) {
-    let h = 0;
-    for (let i = 0; i < content.length; i++) { h = ((h << 5) - h + content.charCodeAt(i)) | 0; }
-    return h;
-  }
-
-  // Known cloud slugs (populated after initial pull)
-  const cloudSlugs = new Set();
-
+  // ── Local → Cloud sync (per-platform change detection) ──
   function scanLocalChanges() {
     const changes = [];
     const newSkills = [];
-    for (const dir of watchDirs) {
+
+    for (const [dir, platform] of dirToPlatform) {
       if (!fs.existsSync(dir)) continue;
       for (const slug of fs.readdirSync(dir)) {
         const skillMd = path.join(dir, slug, "SKILL.md");
         if (!fs.existsSync(skillMd)) continue;
         const content = fs.readFileSync(skillMd, "utf-8");
         const hash = hashContent(content);
-        const prev = localHashes.get(slug);
+        const key = `${platform}:${slug}`;
+        const prev = localHashes.get(key);
+        const deployedHash = deployedHashes.get(key);
 
         if (prev === undefined) {
-          // First scan OR new local skill
-          if (localHashes.size > 0 && !cloudSlugs.has(slug)) {
-            // localHashes populated = not initial scan, and not in cloud = new local skill
-            newSkills.push({ slug, content, dir, type: "new" });
+          // First scan for this platform:slug
+          if (initialScanDone && !cloudSlugs.has(slug)) {
+            newSkills.push({ slug, content, dir, platform, type: "new" });
           }
-        } else if (prev !== hash) {
-          changes.push({ slug, content, dir, type: "changed" });
+        } else if (prev !== hash && hash !== deployedHash) {
+          // Content changed AND differs from what cloud deployed
+          // (skip if it matches deployed hash - that means cloud wrote it)
+          changes.push({ slug, content, dir, platform, type: "changed" });
         }
-        localHashes.set(slug, hash);
+        localHashes.set(key, hash);
       }
     }
     return [...changes, ...newSkills];
   }
 
-  // Store deployed content hashes to detect real changes vs our own writes
-  const deployedHashes = new Map();
-
   async function submitChangeRequests(changes) {
-    const changeRequests = changes.map(c => {
-      // Find what the deployed content was (to include as oldContent)
-      const deployedHash = deployedHashes.get(c.slug);
-      return {
-        slug: c.slug,
-        platform: syncPlatforms[0] || "unknown",
-        oldContent: null, // server will compare
-        newContent: c.content,
-      };
-    });
+    // Each change has its own platform - submit separately per platform:slug
+    const changeRequests = changes.map(c => ({
+      slug: c.slug,
+      platform: c.platform,
+      oldContent: null,
+      newContent: c.content,
+    }));
 
     if (changeRequests.length === 0) return;
 
@@ -875,8 +884,9 @@ async function cmdConnect(args) {
     await heartbeat(r.total);
   } catch (e) { log(`✗ ${e.message}`); }
 
-  // Initialize local hashes (for change detection — won't trigger push on first scan)
+  // Initialize local hashes (for change detection - won't trigger push on first scan)
   scanLocalChanges();
+  initialScanDone = true;
   log("Watching for changes (bidirectional)...\n");
 
   // ── Poll loop ──
