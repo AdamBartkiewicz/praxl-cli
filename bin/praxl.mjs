@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { exec } from "child_process";
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
@@ -78,7 +78,11 @@ function saveToken(token) {
 
 function getUrl() {
   const config = loadConfig();
-  return config.url || DEFAULT_URL;
+  // Ignore localhost URLs from old dev configs
+  if (config.url && !config.url.includes("localhost") && !config.url.includes("127.0.0.1")) {
+    return config.url;
+  }
+  return DEFAULT_URL;
 }
 
 function prompt(q) {
