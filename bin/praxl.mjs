@@ -4,7 +4,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import readline from "readline";
-import { exec } from "child_process";
+import { spawn } from "child_process";
 
 const VERSION = "1.0.1";
 const PKG_NAME = "praxl-app";
@@ -17,6 +17,21 @@ const LOG_FILE = path.join(CONFIG_DIR, "sync.log");
 const PID_FILE = path.join(CONFIG_DIR, "sync.pid");
 
 const DEFAULT_URL = "https://go.praxl.app";
+const MAX_SKILL_SIZE = 1024 * 1024; // 1MB max per skill
+const ALLOWED_HEARTBEAT_ACTIONS = new Set(["sync", "disconnect"]);
+
+// ─── Security helpers ──────────────────────────────────────────────────────
+
+/** Sanitize a path segment — remove traversal, slashes, null bytes */
+function sanitizePath(segment) {
+  if (typeof segment !== "string") return "unknown";
+  return segment
+    .replace(/\.\./g, "")       // no traversal
+    .replace(/[\/\\]/g, "")     // no slashes
+    .replace(/\0/g, "")         // no null bytes
+    .replace(/^\.+/, "")        // no leading dots
+    .trim() || "unknown";
+}
 
 // ─── Auto-update check (non-blocking) ──────────────────────────────────────
 
@@ -73,7 +88,9 @@ function getToken() {
 
 function saveToken(token) {
   ensureConfigDir();
-  fs.writeFileSync(TOKEN_FILE, token);
+  fs.writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+  // Also fix permissions if file already existed
+  try { fs.chmodSync(TOKEN_FILE, 0o600); } catch {}
 }
 
 function getUrl() {
@@ -93,8 +110,13 @@ function prompt(q) {
 // ─── Open browser ──────────────────────────────────────────────────────────
 
 function openBrowser(url) {
+  try {
+    new URL(url); // Validate it's a real URL before opening
+  } catch {
+    return; // Silently refuse invalid URLs
+  }
   const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-  exec(`${cmd} "${url}"`);
+  spawn(cmd, [url], { stdio: "ignore", detached: true }).unref();
 }
 
 // ─── API helpers ────────────────────────────────────────────────────────────
@@ -110,23 +132,45 @@ async function api(endpoint, token, url, options = {}) {
 async function verifyToken(token, url) {
   const res = await api("/api/cli/import", token, url);
   if (!res.ok) return null;
-  return res.json();
+  const data = await res.json();
+  if (!data || typeof data !== "object") return null;
+  return data;
 }
 
 // ─── Write skill to disk ────────────────────────────────────────────────────
 
 function writeSkill(baseDir, slug, content, files = []) {
   try {
-    const dir = path.join(baseDir, slug);
+    const safeSlug = sanitizePath(slug);
+    if (!safeSlug || safeSlug === "unknown") return false;
+
+    // Enforce size limit
+    if (typeof content === "string" && content.length > MAX_SKILL_SIZE) return false;
+
+    const dir = path.join(baseDir, safeSlug);
+    // Verify resolved path is still inside baseDir
+    if (!path.resolve(dir).startsWith(path.resolve(baseDir))) return false;
+
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, "SKILL.md"), content, "utf-8");
     for (const f of files) {
-      const sub = path.join(dir, f.folder);
+      const safeFolder = sanitizePath(f.folder);
+      const safeFilename = sanitizePath(f.filename);
+      const sub = path.join(dir, safeFolder);
+      const filePath = path.join(sub, safeFilename);
+
+      // Verify resolved paths stay inside the skill directory
+      if (!path.resolve(sub).startsWith(path.resolve(dir))) continue;
+      if (!path.resolve(filePath).startsWith(path.resolve(dir))) continue;
+
+      // Enforce size limit per file
+      if (typeof f.content === "string" && f.content.length > MAX_SKILL_SIZE) continue;
+
       fs.mkdirSync(sub, { recursive: true });
       if (f.mimeType?.startsWith("text/") || f.mimeType === "application/json") {
-        fs.writeFileSync(path.join(sub, f.filename), f.content, "utf-8");
+        fs.writeFileSync(filePath, f.content, "utf-8");
       } else {
-        fs.writeFileSync(path.join(sub, f.filename), Buffer.from(f.content, "base64"));
+        fs.writeFileSync(filePath, Buffer.from(f.content, "base64"));
       }
     }
     return true;
@@ -550,18 +594,19 @@ async function cmdSync(args) {
         method: "POST",
         body: JSON.stringify({
           platforms: syncPlatforms,
-          hostname: os.hostname(),
           mode,
           skillCount,
         }),
       });
       if (res.ok) {
         const data = await res.json();
-        // Check if web app triggered a sync
-        if (data.command?.action === "sync") {
-          log("⚡ Sync triggered from web app");
-          const r = await doSync(false);
-          log(`✓ Synced ${r.synced} files (${r.total} skills)`);
+        const action = data.command?.action;
+        if (action && ALLOWED_HEARTBEAT_ACTIONS.has(action)) {
+          if (action === "sync") {
+            log("⚡ Sync triggered from web app");
+            const r = await doSync(false);
+            log(`✓ Synced ${r.synced} files (${r.total} skills)`);
+          }
         }
       }
     } catch {}
@@ -866,19 +911,22 @@ async function cmdConnect(args) {
     try {
       const res = await api("/api/cli/heartbeat", token, url, {
         method: "POST",
-        body: JSON.stringify({ platforms: syncPlatforms, hostname: os.hostname(), mode: "connect", skillCount }),
+        body: JSON.stringify({ platforms: syncPlatforms, mode: "connect", skillCount }),
       });
       if (res.ok) {
         const data = await res.json();
-        if (data.command?.action === "sync") {
-          log("⚡ Sync triggered from web app");
-          const r = await pullFromCloud(false);
-          log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
-        }
-        if (data.command?.action === "disconnect") {
-          log("🔌 Disconnect signal received from web app");
-          log("Goodbye!\n");
-          process.exit(0);
+        const action = data.command?.action;
+        if (action && ALLOWED_HEARTBEAT_ACTIONS.has(action)) {
+          if (action === "sync") {
+            log("⚡ Sync triggered from web app");
+            const r = await pullFromCloud(false);
+            log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
+          }
+          if (action === "disconnect") {
+            log("🔌 Disconnect signal received from web app");
+            log("Goodbye!\n");
+            process.exit(0);
+          }
         }
       }
       // Also report local state periodically
