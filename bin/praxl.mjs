@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { spawn } from "child_process";
 
-const VERSION = "1.0.2";
+const VERSION = "1.0.3";
 const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
@@ -1003,9 +1003,11 @@ function parseArgs(argv) {
     else if (a === "--daemon") { args.daemon = true; }
     else if (a === "--ai") { args.ai = true; }
     else if (a === "--json") { args.json = true; }
+    else if (a === "--version" || a === "-v") { args._cmd = "version"; }
+    else if (a === "--help" || a === "-h") { args._cmd = "help"; }
     else if (!a.startsWith("-")) { positional.push(a); }
   }
-  args._cmd = positional[0] || "sync";
+  if (!args._cmd) args._cmd = positional[0] || "sync";
   return args;
 }
 
