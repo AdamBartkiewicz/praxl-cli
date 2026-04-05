@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { spawn } from "child_process";
 
-const VERSION = "1.0.3";
+const VERSION = "1.0.4";
 const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
@@ -959,6 +959,21 @@ async function cmdConnect(args) {
   scanLocalChanges();
   initialScanDone = true;
   log("Watching for changes (bidirectional)...\n");
+
+  // ── Graceful shutdown: notify server when user closes CLI ──
+  let shuttingDown = false;
+  async function gracefulShutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log("Disconnecting...");
+    try {
+      await api("/api/cli/disconnect", token, url, { method: "POST" });
+    } catch {}
+    process.exit(0);
+  }
+  process.on("SIGINT", gracefulShutdown);
+  process.on("SIGTERM", gracefulShutdown);
+  process.on("SIGHUP", gracefulShutdown);
 
   // ── Poll loop ──
   let lastSkillCount = 0;
