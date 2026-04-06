@@ -1,12 +1,21 @@
 {
   "name": "praxl-app",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Praxl — manage, sync, and deploy AI skills",
   "bin": {
     "praxl": "bin/praxl.mjs"
   },
   "type": "module",
-  "keywords": ["ai", "skills", "claude", "cursor", "codex", "sync", "deploy", "praxl"],
+  "keywords": [
+    "ai",
+    "skills",
+    "claude",
+    "cursor",
+    "codex",
+    "sync",
+    "deploy",
+    "praxl"
+  ],
   "author": "Praxl",
   "license": "MIT",
   "homepage": "https://praxl.app",
