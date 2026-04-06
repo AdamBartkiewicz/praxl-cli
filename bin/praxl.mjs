@@ -833,6 +833,8 @@ async function cmdConnect(args) {
           const h = hashContent(skill.content);
           deployedHashes.set(key, h);
           localHashes.set(key, h);
+          // Update atime map so this write isn't counted as "AI tool read"
+          if (typeof markSkillWritten === "function") markSkillWritten(platform, skill.slug);
         }
       }
     }
@@ -970,6 +972,21 @@ async function cmdConnect(args) {
     } catch {
       // Re-add on failure — will retry next cycle
       usageQueue.unshift(...batch);
+    }
+  }
+
+  // After writing a skill to disk (sync/pull), update its atime in our map
+  // so we don't falsely count the write as a "read by AI tool"
+  function markSkillWritten(platform, slug) {
+    // Check both SKILL.md inside dir and flat .md file
+    for (const suffix of [`${slug}/SKILL.md`, `${slug}.md`]) {
+      const filePath = path.join(PLATFORM_PATHS[platform] || "", suffix);
+      try {
+        if (fs.existsSync(filePath)) {
+          const stat = fs.statSync(filePath);
+          lastAtime.set(`${platform}:${slug}`, stat.atimeMs);
+        }
+      } catch {}
     }
   }
 
