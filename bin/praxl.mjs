@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { spawn } from "child_process";
 
-const VERSION = "1.0.4";
+const VERSION = "1.0.6";
 const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
@@ -49,6 +49,17 @@ async function checkForUpdate() {
   } catch {
     // Silent - don't block CLI usage
   }
+}
+
+// Simple semver comparison: returns true if a < b
+function semverLt(a, b) {
+  const pa = (a || "0.0.0").split(".").map(Number);
+  const pb = (b || "0.0.0").split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) < (pb[i] || 0)) return true;
+    if ((pa[i] || 0) > (pb[i] || 0)) return false;
+  }
+  return false;
 }
 
 const PLATFORM_PATHS = {
@@ -596,6 +607,7 @@ async function cmdSync(args) {
           platforms: syncPlatforms,
           mode,
           skillCount,
+          version: VERSION,
         }),
       });
       if (res.ok) {
@@ -964,14 +976,34 @@ async function cmdConnect(args) {
   // Initialize atimes on first pass (won't generate events)
   trackSkillUsage();
 
+  let versionWarningShown = false;
+
   async function heartbeat(skillCount) {
     try {
       const res = await api("/api/cli/heartbeat", token, url, {
         method: "POST",
-        body: JSON.stringify({ platforms: syncPlatforms, mode: "connect", skillCount }),
+        body: JSON.stringify({ platforms: syncPlatforms, mode: "connect", skillCount, version: VERSION }),
       });
       if (res.ok) {
         const data = await res.json();
+
+        // Version policy enforcement
+        if (data.versionPolicy && !versionWarningShown) {
+          const { minimum, recommended } = data.versionPolicy;
+          if (minimum && semverLt(VERSION, minimum)) {
+            const c = { red: "\x1b[31m", cyan: "\x1b[36m", bold: "\x1b[1m", reset: "\x1b[0m" };
+            log(`${c.red}${c.bold}✗ CLI version ${VERSION} is no longer supported. Minimum: ${minimum}${c.reset}`);
+            log(`  Run: ${c.cyan}npm install -g ${PKG_NAME}${c.reset}`);
+            log("  Exiting — please update and reconnect.\n");
+            process.exit(1);
+          } else if (recommended && semverLt(VERSION, recommended)) {
+            const c = { yellow: "\x1b[33m", cyan: "\x1b[36m", reset: "\x1b[0m" };
+            log(`${c.yellow}⚠ Update available: ${VERSION} → ${recommended}${c.reset}`);
+            log(`  Run: ${c.cyan}npm install -g ${PKG_NAME}${c.reset}\n`);
+            versionWarningShown = true; // Show only once per session
+          }
+        }
+
         const action = data.command?.action;
         if (action && ALLOWED_HEARTBEAT_ACTIONS.has(action)) {
           if (action === "sync") {

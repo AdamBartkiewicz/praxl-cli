@@ -1,6 +1,6 @@
 {
   "name": "praxl-app",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Praxl — manage, sync, and deploy AI skills",
   "bin": {
     "praxl": "bin/praxl.mjs"
