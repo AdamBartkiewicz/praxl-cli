@@ -907,6 +907,63 @@ async function cmdConnect(args) {
     } catch {}
   }
 
+  // ── Usage tracking via atime ──
+  const lastAtime = new Map(); // key: "platform:slug" → atimeMs
+  const usageQueue = []; // batched events to send
+
+  function trackSkillUsage() {
+    for (const [platform, dir] of Object.entries(PLATFORM_PATHS)) {
+      if (!syncPlatforms.includes(platform)) continue;
+      if (!fs.existsSync(dir)) continue;
+      let entries;
+      try { entries = fs.readdirSync(dir); } catch { continue; }
+      for (const slug of entries) {
+        const skillMd = path.join(dir, slug, "SKILL.md");
+        if (!fs.existsSync(skillMd)) {
+          // Maybe it's a flat .md file
+          const flatMd = path.join(dir, slug);
+          if (!slug.endsWith(".md") || !fs.existsSync(flatMd)) continue;
+          try {
+            const stat = fs.statSync(flatMd);
+            const key = `${platform}:${slug.replace(/\.md$/, "")}`;
+            const prev = lastAtime.get(key);
+            if (prev !== undefined && stat.atimeMs > prev) {
+              usageQueue.push({ slug: slug.replace(/\.md$/, ""), platform, usedAt: new Date(stat.atimeMs).toISOString() });
+            }
+            lastAtime.set(key, stat.atimeMs);
+          } catch {}
+          continue;
+        }
+        try {
+          const stat = fs.statSync(skillMd);
+          const key = `${platform}:${slug}`;
+          const prev = lastAtime.get(key);
+          if (prev !== undefined && stat.atimeMs > prev) {
+            usageQueue.push({ slug, platform, usedAt: new Date(stat.atimeMs).toISOString() });
+          }
+          lastAtime.set(key, stat.atimeMs);
+        } catch {}
+      }
+    }
+  }
+
+  async function flushUsageEvents() {
+    if (usageQueue.length === 0) return;
+    const batch = usageQueue.splice(0, 500);
+    try {
+      await api("/api/cli/usage", token, url, {
+        method: "POST",
+        body: JSON.stringify({ events: batch }),
+      });
+    } catch {
+      // Re-add on failure — will retry next cycle
+      usageQueue.unshift(...batch);
+    }
+  }
+
+  // Initialize atimes on first pass (won't generate events)
+  trackSkillUsage();
+
   async function heartbeat(skillCount) {
     try {
       const res = await api("/api/cli/heartbeat", token, url, {
@@ -998,6 +1055,10 @@ async function cmdConnect(args) {
 
       // 3. Heartbeat + report local state
       await heartbeat(lastSkillCount);
+
+      // 4. Track skill file reads (atime) + flush to server
+      trackSkillUsage();
+      await flushUsageEvents();
     } catch (e) { /* silent */ }
   }, interval * 1000);
 }
