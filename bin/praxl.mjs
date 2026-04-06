@@ -18,7 +18,7 @@ const PID_FILE = path.join(CONFIG_DIR, "sync.pid");
 
 const DEFAULT_URL = "https://go.praxl.app";
 const MAX_SKILL_SIZE = 1024 * 1024; // 1MB max per skill
-const ALLOWED_HEARTBEAT_ACTIONS = new Set(["sync", "disconnect"]);
+const ALLOWED_HEARTBEAT_ACTIONS = new Set(["sync", "disconnect", "import"]);
 
 // ─── Security helpers ──────────────────────────────────────────────────────
 
@@ -904,6 +904,43 @@ async function cmdConnect(args) {
 
   // ── Heartbeat ──
   // Report local file state to cloud
+  async function importLocalSkills() {
+    const batch = [];
+    for (const platform of syncPlatforms) {
+      const dir = platformPaths[platform] || path.join(HOME, `.${platform}/skills`);
+      if (!fs.existsSync(dir)) continue;
+      for (const slug of fs.readdirSync(dir)) {
+        const skillMd = path.join(dir, slug, "SKILL.md");
+        if (!fs.existsSync(skillMd)) continue;
+        try {
+          const content = fs.readFileSync(skillMd, "utf-8");
+          // Extract name from frontmatter or slug
+          const nameMatch = content.match(/^name:\s*["']?(.+?)["']?\s*$/m);
+          const name = nameMatch ? nameMatch[1] : slug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+          batch.push({ slug, name, content, platform });
+        } catch {}
+      }
+    }
+    if (batch.length === 0) {
+      log("  No local skills to import");
+      return;
+    }
+    try {
+      const res = await api("/api/cli/import-batch", token, url, {
+        method: "POST",
+        body: JSON.stringify({ skills: batch }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        log(`✓ Imported ${data.imported} skills (${data.total} found)`);
+      } else {
+        log(`✗ Import failed: ${res.status}`);
+      }
+    } catch (e) {
+      log(`✗ Import error: ${e.message}`);
+    }
+  }
+
   async function reportLocalState() {
     const localSkills = [];
     for (const platform of syncPlatforms) {
@@ -1032,6 +1069,10 @@ async function cmdConnect(args) {
             log("🔌 Disconnect signal received from web app");
             log("Goodbye!\n");
             process.exit(0);
+          }
+          if (action === "import") {
+            log("📥 Import triggered from web app");
+            await importLocalSkills();
           }
         }
       }
