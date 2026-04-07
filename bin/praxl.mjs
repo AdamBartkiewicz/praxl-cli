@@ -904,12 +904,14 @@ async function cmdConnect(args) {
 
   // ── Heartbeat ──
   // Report local file state to cloud
-  async function importLocalSkills() {
+  async function importLocalSkills(allowedSlugs) {
     const batch = [];
     for (const platform of syncPlatforms) {
       const dir = platformPaths[platform] || path.join(HOME, `.${platform}/skills`);
       if (!fs.existsSync(dir)) continue;
       for (const slug of fs.readdirSync(dir)) {
+        // Filter by allowed slugs if specified (from onboarding selection)
+        if (allowedSlugs && allowedSlugs.length > 0 && !allowedSlugs.includes(slug)) continue;
         const skillMd = path.join(dir, slug, "SKILL.md");
         if (!fs.existsSync(skillMd)) continue;
         try {
@@ -926,9 +928,11 @@ async function cmdConnect(args) {
       return;
     }
     try {
+      const payload = { skills: batch };
+      if (allowedSlugs && allowedSlugs.length > 0) payload.slugs = allowedSlugs;
       const res = await api("/api/cli/import-batch", token, url, {
         method: "POST",
-        body: JSON.stringify({ skills: batch }),
+        body: JSON.stringify(payload),
       });
       if (res.ok) {
         const data = await res.json();
@@ -1071,8 +1075,9 @@ async function cmdConnect(args) {
             process.exit(0);
           }
           if (action === "import") {
-            log("📥 Import triggered from web app");
-            await importLocalSkills();
+            const slugs = data.command?.slugs;
+            log(`📥 Import triggered from web app${slugs?.length ? ` (${slugs.length} selected)` : ""}`);
+            await importLocalSkills(slugs);
           }
         }
       }
