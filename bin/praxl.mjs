@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { spawn } from "child_process";
 
-const VERSION = "1.1.4";
+const VERSION = "1.2.0";
 const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
@@ -834,7 +834,7 @@ async function cmdConnect(args) {
           deployedHashes.set(key, h);
           localHashes.set(key, h);
           // Update atime map so this write isn't counted as "AI tool read"
-          if (typeof markSkillWritten === "function") markSkillWritten(platform, skill.slug);
+          // markSkillWritten removed - usage tracking is now based on session logs, not atime
         }
       }
     }
@@ -962,55 +962,58 @@ async function cmdConnect(args) {
     } catch {}
   }
 
-  // ── Usage tracking via atime ──
-  const lastAtime = new Map(); // key: "platform:slug" → atimeMs
-  const lastEventTime = new Map(); // key: "platform:slug" → timestamp of last reported event
+  // ── Usage tracking via AI tool session logs ──
   const usageQueue = []; // batched events to send
 
-  // Minimum time between events for the same skill (5 minutes)
-  const MIN_EVENT_INTERVAL_MS = 5 * 60 * 1000;
+  // ── Session log-based usage tracking ──
+  // Claude Code logs skill loads to ~/.claude/projects/*/session.jsonl
+  // We scan recent session logs for "Base directory for this skill:" entries
+  const seenSessionEvents = new Set(); // "sessionId:slug:timestamp" to deduplicate
 
-  /** Scan all skill files and update atime map. If emitEvents=false, only updates the map (no usage events). */
-  function trackSkillUsage(emitEvents = true) {
-    for (const [platform, dir] of Object.entries(PLATFORM_PATHS)) {
-      if (!syncPlatforms.includes(platform)) continue;
-      if (!fs.existsSync(dir)) continue;
-      let entries;
-      try { entries = fs.readdirSync(dir); } catch { continue; }
-      for (const slug of entries) {
-        const skillMd = path.join(dir, slug, "SKILL.md");
-        if (!fs.existsSync(skillMd)) {
-          const flatMd = path.join(dir, slug);
-          if (!slug.endsWith(".md") || !fs.existsSync(flatMd)) continue;
-          try {
-            const stat = fs.statSync(flatMd);
-            const cleanSlug = slug.replace(/\.md$/, "");
-            const key = `${platform}:${cleanSlug}`;
-            const prev = lastAtime.get(key);
-            if (emitEvents && prev !== undefined && stat.atimeMs > prev) {
-              const lastEvent = lastEventTime.get(key) || 0;
-              if (Date.now() - lastEvent > MIN_EVENT_INTERVAL_MS) {
-                usageQueue.push({ slug: cleanSlug, platform, usedAt: new Date(stat.atimeMs).toISOString() });
-                lastEventTime.set(key, Date.now());
-              }
-            }
-            lastAtime.set(key, stat.atimeMs);
-          } catch {}
-          continue;
-        }
+  function trackSkillUsage() {
+    const projectsDir = path.join(HOME, ".claude", "projects");
+    if (!fs.existsSync(projectsDir)) return;
+    let dirs;
+    try { dirs = fs.readdirSync(projectsDir); } catch { return; }
+
+    for (const dir of dirs) {
+      const fullDir = path.join(projectsDir, dir);
+      try { if (!fs.statSync(fullDir).isDirectory()) continue; } catch { continue; }
+      let files;
+      try { files = fs.readdirSync(fullDir).filter(f => f.endsWith(".jsonl")); } catch { continue; }
+
+      for (const file of files) {
+        const fp = path.join(fullDir, file);
         try {
-          const stat = fs.statSync(skillMd);
-          const key = `${platform}:${slug}`;
-          const prev = lastAtime.get(key);
-          if (emitEvents && prev !== undefined && stat.atimeMs > prev) {
-            const lastEvent = lastEventTime.get(key) || 0;
-            if (Date.now() - lastEvent > MIN_EVENT_INTERVAL_MS) {
-              usageQueue.push({ slug, platform, usedAt: new Date(stat.atimeMs).toISOString() });
-              lastEventTime.set(key, Date.now());
-            }
-          }
-          lastAtime.set(key, stat.atimeMs);
-        } catch {}
+          const stat = fs.statSync(fp);
+          // Only check files modified in last 5 minutes (performance)
+          if (Date.now() - stat.mtimeMs > 5 * 60 * 1000) continue;
+        } catch { continue; }
+
+        let content;
+        try { content = fs.readFileSync(fp, "utf-8"); } catch { continue; }
+
+        const lines = content.split("\n").filter(Boolean);
+        for (const line of lines) {
+          if (!line.includes("Base directory for this skill:") || !line.includes("/.claude/skills/")) continue;
+          try {
+            const match = line.match(/\.claude\/skills\/([^/\\"]+)/);
+            if (!match) continue;
+            const slug = match[1];
+            const parsed = JSON.parse(line);
+            const timestamp = parsed.timestamp || "";
+            const sessionId = file.replace(".jsonl", "").slice(0, 8);
+            const dedupeKey = `${sessionId}:${slug}:${timestamp}`;
+            if (seenSessionEvents.has(dedupeKey)) continue;
+            seenSessionEvents.add(dedupeKey);
+
+            usageQueue.push({
+              slug,
+              platform: "claude-code",
+              usedAt: timestamp || new Date().toISOString(),
+            });
+          } catch {}
+        }
       }
     }
   }
@@ -1029,23 +1032,9 @@ async function cmdConnect(args) {
     }
   }
 
-  // After writing a skill to disk (sync/pull), update its atime in our map
-  // so we don't falsely count the write as a "read by AI tool"
-  function markSkillWritten(platform, slug) {
-    // Check both SKILL.md inside dir and flat .md file
-    for (const suffix of [`${slug}/SKILL.md`, `${slug}.md`]) {
-      const filePath = path.join(PLATFORM_PATHS[platform] || "", suffix);
-      try {
-        if (fs.existsSync(filePath)) {
-          const stat = fs.statSync(filePath);
-          lastAtime.set(`${platform}:${slug}`, stat.atimeMs);
-        }
-      } catch {}
-    }
-  }
-
-  // Initialize atimes on first pass (won't generate events)
-  trackSkillUsage(false);
+  // Initialize: scan existing session logs to populate seenSessionEvents (no events emitted on first run)
+  trackSkillUsage();
+  usageQueue.length = 0; // discard events from past sessions
 
   let versionWarningShown = false;
 
@@ -1080,7 +1069,6 @@ async function cmdConnect(args) {
           if (action === "sync") {
             log("⚡ Sync triggered from web app");
             const r = await pullFromCloud(false);
-            trackSkillUsage(false); // refresh atime map after writing files
             log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
           }
           if (action === "disconnect") {
@@ -1092,7 +1080,6 @@ async function cmdConnect(args) {
             const slugs = data.command?.slugs;
             log(`📥 Import triggered from web app${slugs?.length ? ` (${slugs.length} selected)` : ""}`);
             await importLocalSkills(slugs);
-            trackSkillUsage(false); // refresh atime map after import
           }
         }
       }
@@ -1122,8 +1109,6 @@ async function cmdConnect(args) {
     await heartbeat(r.total);
   } catch (e) { log(`✗ ${e.message}`); }
 
-  // Refresh atime map after initial sync (sync wrote files, don't count as usage)
-  trackSkillUsage(false);
 
   // Initialize local hashes (for change detection - won't trigger push on first scan)
   scanLocalChanges();
@@ -1170,8 +1155,9 @@ async function cmdConnect(args) {
       // 3. Heartbeat + report local state
       await heartbeat(lastSkillCount);
 
-      // 4. Usage tracking disabled (atime unreliable on macOS APFS)
-      // Usage is tracked server-side via AI review/chat/skill-open events instead
+      // 4. Track skill usage from AI tool session logs
+      trackSkillUsage();
+      await flushUsageEvents();
     } catch (e) { /* silent */ }
   }, interval * 1000);
 }
