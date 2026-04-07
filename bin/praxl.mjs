@@ -966,20 +966,12 @@ async function cmdConnect(args) {
   const lastAtime = new Map(); // key: "platform:slug" → atimeMs
   const lastEventTime = new Map(); // key: "platform:slug" → timestamp of last reported event
   const usageQueue = []; // batched events to send
-  let cooldownUntil = 0; // global cooldown after sync/scan/import operations
-
-  // Suppress false usage events for N seconds after any sync/scan/import
-  function setCooldown(seconds = 30) {
-    cooldownUntil = Date.now() + seconds * 1000;
-  }
 
   // Minimum time between events for the same skill (5 minutes)
   const MIN_EVENT_INTERVAL_MS = 5 * 60 * 1000;
 
-  function trackSkillUsage() {
-    // Skip during cooldown (after sync/scan/import)
-    if (Date.now() < cooldownUntil) return;
-
+  /** Scan all skill files and update atime map. If emitEvents=false, only updates the map (no usage events). */
+  function trackSkillUsage(emitEvents = true) {
     for (const [platform, dir] of Object.entries(PLATFORM_PATHS)) {
       if (!syncPlatforms.includes(platform)) continue;
       if (!fs.existsSync(dir)) continue;
@@ -988,7 +980,6 @@ async function cmdConnect(args) {
       for (const slug of entries) {
         const skillMd = path.join(dir, slug, "SKILL.md");
         if (!fs.existsSync(skillMd)) {
-          // Maybe it's a flat .md file
           const flatMd = path.join(dir, slug);
           if (!slug.endsWith(".md") || !fs.existsSync(flatMd)) continue;
           try {
@@ -996,8 +987,7 @@ async function cmdConnect(args) {
             const cleanSlug = slug.replace(/\.md$/, "");
             const key = `${platform}:${cleanSlug}`;
             const prev = lastAtime.get(key);
-            if (prev !== undefined && stat.atimeMs > prev) {
-              // Check minimum interval between events
+            if (emitEvents && prev !== undefined && stat.atimeMs > prev) {
               const lastEvent = lastEventTime.get(key) || 0;
               if (Date.now() - lastEvent > MIN_EVENT_INTERVAL_MS) {
                 usageQueue.push({ slug: cleanSlug, platform, usedAt: new Date(stat.atimeMs).toISOString() });
@@ -1012,7 +1002,7 @@ async function cmdConnect(args) {
           const stat = fs.statSync(skillMd);
           const key = `${platform}:${slug}`;
           const prev = lastAtime.get(key);
-          if (prev !== undefined && stat.atimeMs > prev) {
+          if (emitEvents && prev !== undefined && stat.atimeMs > prev) {
             const lastEvent = lastEventTime.get(key) || 0;
             if (Date.now() - lastEvent > MIN_EVENT_INTERVAL_MS) {
               usageQueue.push({ slug, platform, usedAt: new Date(stat.atimeMs).toISOString() });
@@ -1055,7 +1045,7 @@ async function cmdConnect(args) {
   }
 
   // Initialize atimes on first pass (won't generate events)
-  trackSkillUsage();
+  trackSkillUsage(false);
 
   let versionWarningShown = false;
 
@@ -1089,8 +1079,8 @@ async function cmdConnect(args) {
         if (action && ALLOWED_HEARTBEAT_ACTIONS.has(action)) {
           if (action === "sync") {
             log("⚡ Sync triggered from web app");
-            setCooldown(30);
             const r = await pullFromCloud(false);
+            trackSkillUsage(false); // refresh atime map after writing files
             log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
           }
           if (action === "disconnect") {
@@ -1101,8 +1091,8 @@ async function cmdConnect(args) {
           if (action === "import") {
             const slugs = data.command?.slugs;
             log(`📥 Import triggered from web app${slugs?.length ? ` (${slugs.length} selected)` : ""}`);
-            setCooldown(30);
             await importLocalSkills(slugs);
+            trackSkillUsage(false); // refresh atime map after import
           }
         }
       }
@@ -1129,9 +1119,11 @@ async function cmdConnect(args) {
     }
     const r = await pullFromCloud(false);
     log(`✓ ${r.synced} files synced (${r.total} skills total)`);
-    setCooldown(30); // suppress false usage events from initial sync
     await heartbeat(r.total);
   } catch (e) { log(`✗ ${e.message}`); }
+
+  // Refresh atime map after initial sync (sync wrote files, don't count as usage)
+  trackSkillUsage(false);
 
   // Initialize local hashes (for change detection - won't trigger push on first scan)
   scanLocalChanges();
@@ -1170,7 +1162,7 @@ async function cmdConnect(args) {
       const r = await pullFromCloud(true);
       if (r.synced > 0) {
         log(`↓ Pulled ${r.synced} updated files`);
-        setCooldown(15); // suppress false reads after pulling new files
+        trackSkillUsage(false); // refresh atime map after writing files
         scanLocalChanges();
       }
       if (r.total > 0) lastSkillCount = r.total;
