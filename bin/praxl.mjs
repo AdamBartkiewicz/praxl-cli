@@ -964,9 +964,22 @@ async function cmdConnect(args) {
 
   // ── Usage tracking via atime ──
   const lastAtime = new Map(); // key: "platform:slug" → atimeMs
+  const lastEventTime = new Map(); // key: "platform:slug" → timestamp of last reported event
   const usageQueue = []; // batched events to send
+  let cooldownUntil = 0; // global cooldown after sync/scan/import operations
+
+  // Suppress false usage events for N seconds after any sync/scan/import
+  function setCooldown(seconds = 30) {
+    cooldownUntil = Date.now() + seconds * 1000;
+  }
+
+  // Minimum time between events for the same skill (5 minutes)
+  const MIN_EVENT_INTERVAL_MS = 5 * 60 * 1000;
 
   function trackSkillUsage() {
+    // Skip during cooldown (after sync/scan/import)
+    if (Date.now() < cooldownUntil) return;
+
     for (const [platform, dir] of Object.entries(PLATFORM_PATHS)) {
       if (!syncPlatforms.includes(platform)) continue;
       if (!fs.existsSync(dir)) continue;
@@ -980,10 +993,16 @@ async function cmdConnect(args) {
           if (!slug.endsWith(".md") || !fs.existsSync(flatMd)) continue;
           try {
             const stat = fs.statSync(flatMd);
-            const key = `${platform}:${slug.replace(/\.md$/, "")}`;
+            const cleanSlug = slug.replace(/\.md$/, "");
+            const key = `${platform}:${cleanSlug}`;
             const prev = lastAtime.get(key);
             if (prev !== undefined && stat.atimeMs > prev) {
-              usageQueue.push({ slug: slug.replace(/\.md$/, ""), platform, usedAt: new Date(stat.atimeMs).toISOString() });
+              // Check minimum interval between events
+              const lastEvent = lastEventTime.get(key) || 0;
+              if (Date.now() - lastEvent > MIN_EVENT_INTERVAL_MS) {
+                usageQueue.push({ slug: cleanSlug, platform, usedAt: new Date(stat.atimeMs).toISOString() });
+                lastEventTime.set(key, Date.now());
+              }
             }
             lastAtime.set(key, stat.atimeMs);
           } catch {}
@@ -994,7 +1013,11 @@ async function cmdConnect(args) {
           const key = `${platform}:${slug}`;
           const prev = lastAtime.get(key);
           if (prev !== undefined && stat.atimeMs > prev) {
-            usageQueue.push({ slug, platform, usedAt: new Date(stat.atimeMs).toISOString() });
+            const lastEvent = lastEventTime.get(key) || 0;
+            if (Date.now() - lastEvent > MIN_EVENT_INTERVAL_MS) {
+              usageQueue.push({ slug, platform, usedAt: new Date(stat.atimeMs).toISOString() });
+              lastEventTime.set(key, Date.now());
+            }
           }
           lastAtime.set(key, stat.atimeMs);
         } catch {}
@@ -1066,6 +1089,7 @@ async function cmdConnect(args) {
         if (action && ALLOWED_HEARTBEAT_ACTIONS.has(action)) {
           if (action === "sync") {
             log("⚡ Sync triggered from web app");
+            setCooldown(30);
             const r = await pullFromCloud(false);
             log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
           }
@@ -1077,6 +1101,7 @@ async function cmdConnect(args) {
           if (action === "import") {
             const slugs = data.command?.slugs;
             log(`📥 Import triggered from web app${slugs?.length ? ` (${slugs.length} selected)` : ""}`);
+            setCooldown(30);
             await importLocalSkills(slugs);
           }
         }
@@ -1104,6 +1129,7 @@ async function cmdConnect(args) {
     }
     const r = await pullFromCloud(false);
     log(`✓ ${r.synced} files synced (${r.total} skills total)`);
+    setCooldown(30); // suppress false usage events from initial sync
     await heartbeat(r.total);
   } catch (e) { log(`✗ ${e.message}`); }
 
@@ -1142,11 +1168,12 @@ async function cmdConnect(args) {
 
       // 2. Check for cloud changes → pull to local
       const r = await pullFromCloud(true);
-      if (r.total > 0) {
+      if (r.synced > 0) {
         log(`↓ Pulled ${r.synced} updated files`);
-        lastSkillCount = r.total;
+        setCooldown(15); // suppress false reads after pulling new files
         scanLocalChanges();
       }
+      if (r.total > 0) lastSkillCount = r.total;
 
       // 3. Heartbeat + report local state
       await heartbeat(lastSkillCount);
