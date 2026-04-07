@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { spawn } from "child_process";
 
-const VERSION = "1.1.3";
+const VERSION = "1.1.4";
 const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
@@ -1170,9 +1170,8 @@ async function cmdConnect(args) {
       // 3. Heartbeat + report local state
       await heartbeat(lastSkillCount);
 
-      // 4. Track skill file reads (atime) + flush to server
-      trackSkillUsage();
-      await flushUsageEvents();
+      // 4. Usage tracking disabled (atime unreliable on macOS APFS)
+      // Usage is tracked server-side via AI review/chat/skill-open events instead
     } catch (e) { /* silent */ }
   }, interval * 1000);
 }
