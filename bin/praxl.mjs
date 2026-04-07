@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { spawn } from "child_process";
 
-const VERSION = "1.0.6";
+const VERSION = "1.1.3";
 const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
