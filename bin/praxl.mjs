@@ -70,6 +70,7 @@ const PLATFORM_PATHS = {
   "windsurf": path.join(HOME, ".windsurf/skills"),
   "opencode": path.join(HOME, ".opencode/skills"),
   "gemini-cli": path.join(HOME, ".claude/skills"),
+  "openclaw": path.join(HOME, ".openclaw/skills"),
 };
 
 // ─── Config helpers ─────────────────────────────────────────────────────────
