@@ -6,7 +6,7 @@ import os from "os";
 import readline from "readline";
 import { spawn } from "child_process";
 
-const VERSION = "1.2.1";
+const VERSION = "1.3.0";
 const PKG_NAME = "praxl-app";
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".praxl");
@@ -15,10 +15,17 @@ const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const STATE_FILE = path.join(CONFIG_DIR, "sync-state.json");
 const LOG_FILE = path.join(CONFIG_DIR, "sync.log");
 const PID_FILE = path.join(CONFIG_DIR, "sync.pid");
+const AUDIT_FILE = path.join(CONFIG_DIR, "audit.log");
 
 const DEFAULT_URL = "https://go.praxl.app";
 const MAX_SKILL_SIZE = 1024 * 1024; // 1MB max per skill
 const ALLOWED_HEARTBEAT_ACTIONS = new Set(["sync", "disconnect", "import"]);
+const ALLOWED_FILE_EXTENSIONS = new Set([
+  ".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".xml",
+  ".toml", ".ini", ".html", ".svg", ".png",
+]);
+const ALLOWED_URL_SCHEMES = new Set(["http:", "https:"]);
+const IMPORT_RATE_LIMIT_MS = 10 * 60 * 1000; // 10 min between server-triggered imports
 
 // ─── Security helpers ──────────────────────────────────────────────────────
 
@@ -73,6 +80,45 @@ const PLATFORM_PATHS = {
   "openclaw": path.join(HOME, ".openclaw/skills"),
 };
 
+/** Append a security-relevant event to the audit log. Best-effort, never throws. */
+function audit(level, msg) {
+  try {
+    if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.appendFileSync(AUDIT_FILE, `${new Date().toISOString()} [${level}] ${msg}\n`);
+  } catch {}
+}
+
+/**
+ * Check whether a basePath is allowed as a skill write target.
+ * Default platform dot-folders are always trusted. Additional paths can be
+ * added by the user via `praxl trust-path <dir>` and are stored locally —
+ * the server can NEVER expand this list.
+ */
+function isBasePathTrusted(basePath) {
+  let resolved;
+  try {
+    resolved = path.resolve(basePath.replace(/^~/, HOME));
+  } catch {
+    return false;
+  }
+  // Built-in default platform paths
+  for (const p of Object.values(PLATFORM_PATHS)) {
+    if (resolved === path.resolve(p)) return true;
+  }
+  // User-added trusted paths from local config (never settable from server)
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      const config = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+      const trusted = Array.isArray(config.trustedPaths) ? config.trustedPaths : [];
+      for (const p of trusted) {
+        const expanded = path.resolve(String(p).replace(/^~/, HOME));
+        if (resolved === expanded) return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
 // ─── Config helpers ─────────────────────────────────────────────────────────
 
 function ensureConfigDir() {
@@ -122,10 +168,16 @@ function prompt(q) {
 // ─── Open browser ──────────────────────────────────────────────────────────
 
 function openBrowser(url) {
+  let parsed;
   try {
-    new URL(url); // Validate it's a real URL before opening
+    parsed = new URL(url);
   } catch {
     return; // Silently refuse invalid URLs
+  }
+  // Allowlist schemes — block javascript:, file:, ssh:, custom: etc.
+  if (!ALLOWED_URL_SCHEMES.has(parsed.protocol)) {
+    audit("WARN", `openBrowser rejected scheme: ${parsed.protocol} (url=${String(url).slice(0, 120)})`);
+    return;
   }
   const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
   spawn(cmd, [url], { stdio: "ignore", detached: true }).unref();
@@ -174,6 +226,13 @@ function writeSkill(baseDir, slug, content, files = []) {
       // Verify resolved paths stay inside the skill directory
       if (!path.resolve(sub).startsWith(path.resolve(dir))) continue;
       if (!path.resolve(filePath).startsWith(path.resolve(dir))) continue;
+
+      // Allowlist file extensions — block executables and unknown binaries
+      const ext = path.extname(safeFilename).toLowerCase();
+      if (!ALLOWED_FILE_EXTENSIONS.has(ext)) {
+        audit("WARN", `writeSkill rejected file: ${safeSlug}/${safeFolder}/${safeFilename} (extension '${ext || "<none>"}' not allowed)`);
+        continue;
+      }
 
       // Enforce size limit per file
       if (typeof f.content === "string" && f.content.length > MAX_SKILL_SIZE) continue;
@@ -554,9 +613,16 @@ async function cmdSync(args) {
         if (activeTargets.length > 0) {
           syncPlatforms = activeTargets.map(t => t.platform);
           log(`Platforms from config: ${activeTargets.map(t => `${t.label} (${t.basePath})`).join(", ")}`);
-          // Override PLATFORM_PATHS with custom paths from config
+          // Override PLATFORM_PATHS with custom paths from config — only if trusted
           for (const t of activeTargets) {
-            if (t.basePath) PLATFORM_PATHS[t.platform] = t.basePath.replace(/^~/, HOME);
+            if (!t.basePath) continue;
+            const expanded = t.basePath.replace(/^~/, HOME);
+            if (isBasePathTrusted(expanded)) {
+              PLATFORM_PATHS[t.platform] = expanded;
+            } else {
+              log(`⚠ Server basePath '${t.basePath}' for ${t.platform} not in trust list — using default. Run: praxl trust-path ${t.basePath}`);
+              audit("WARN", `basePath rejected (cmdSync): ${expanded} for platform ${t.platform}`);
+            }
           }
         }
       }
@@ -616,6 +682,7 @@ async function cmdSync(args) {
         const action = data.command?.action;
         if (action && ALLOWED_HEARTBEAT_ACTIONS.has(action)) {
           if (action === "sync") {
+            audit("INFO", "heartbeat action received: sync (cmdSync)");
             log("⚡ Sync triggered from web app");
             const r = await doSync(false);
             log(`✓ Synced ${r.synced} files (${r.total} skills)`);
@@ -745,6 +812,7 @@ async function cmdConnect(args) {
 
   const userName = data.user?.name || data.user?.email || "unknown";
   console.log(`  ✓ Connected as ${userName}\n`);
+  audit("INFO", `connect started: user=${userName} url=${url} version=${VERSION}`);
 
   // Fetch platform config
   let syncPlatforms = ["claude-code"];
@@ -757,7 +825,16 @@ async function cmdConnect(args) {
       if (active.length > 0) {
         syncPlatforms = active.map(t => t.platform);
         for (const t of active) {
-          if (t.basePath) platformPaths[t.platform] = t.basePath.replace(/^~/, HOME);
+          if (!t.basePath) continue;
+          const expanded = t.basePath.replace(/^~/, HOME);
+          if (isBasePathTrusted(expanded)) {
+            platformPaths[t.platform] = expanded;
+          } else {
+            const def = (platformPaths[t.platform] || path.join(HOME, `.${t.platform}/skills`)).replace(HOME, "~");
+            console.log(`  ⚠ Server requested basePath '${t.basePath}' for ${t.platform} — not trusted, using default ${def}`);
+            console.log(`     Run: praxl trust-path ${t.basePath}  (to allow this location)`);
+            audit("WARN", `basePath rejected (cmdConnect): ${expanded} for platform ${t.platform}`);
+          }
         }
       }
     }
@@ -1038,6 +1115,7 @@ async function cmdConnect(args) {
   usageQueue.length = 0; // discard events from past sessions
 
   let versionWarningShown = false;
+  let lastImportAt = 0; // for server-triggered "import" rate limiting
 
   async function heartbeat(skillCount) {
     try {
@@ -1068,19 +1146,30 @@ async function cmdConnect(args) {
         const action = data.command?.action;
         if (action && ALLOWED_HEARTBEAT_ACTIONS.has(action)) {
           if (action === "sync") {
+            audit("INFO", "heartbeat action received: sync");
             log("⚡ Sync triggered from web app");
             const r = await pullFromCloud(false);
             log(`✓ Pulled ${r.synced} files (${r.total} skills)`);
           }
           if (action === "disconnect") {
+            audit("INFO", "heartbeat action received: disconnect");
             log("🔌 Disconnect signal received from web app");
             log("Goodbye!\n");
             process.exit(0);
           }
           if (action === "import") {
-            const slugs = data.command?.slugs;
-            log(`📥 Import triggered from web app${slugs?.length ? ` (${slugs.length} selected)` : ""}`);
-            await importLocalSkills(slugs);
+            const now = Date.now();
+            if (now - lastImportAt < IMPORT_RATE_LIMIT_MS) {
+              const remainingS = Math.ceil((IMPORT_RATE_LIMIT_MS - (now - lastImportAt)) / 1000);
+              log(`⏳ Import skipped — rate limited (${remainingS}s remaining)`);
+              audit("WARN", `import action rate-limited (${remainingS}s remaining)`);
+            } else {
+              lastImportAt = now;
+              const slugs = data.command?.slugs;
+              audit("INFO", `heartbeat action received: import (slugs=${slugs?.length || 0})`);
+              log(`📥 Import triggered from web app${slugs?.length ? ` (${slugs.length} selected)` : ""}`);
+              await importLocalSkills(slugs);
+            }
           }
         }
       }
@@ -1163,6 +1252,76 @@ async function cmdConnect(args) {
   }, interval * 1000);
 }
 
+// ─── Trust-path command ─────────────────────────────────────────────────────
+
+async function cmdTrustPath(args) {
+  const config = loadConfig();
+  if (!Array.isArray(config.trustedPaths)) config.trustedPaths = [];
+
+  // List
+  if (args.list) {
+    console.log("\n  Trusted skill base paths\n");
+    console.log("  Default (built-in, always trusted):");
+    const seen = new Set();
+    for (const p of Object.values(PLATFORM_PATHS)) {
+      if (seen.has(p)) continue;
+      seen.add(p);
+      console.log(`    ${p.replace(HOME, "~")}`);
+    }
+    console.log("\n  User-added:");
+    if (config.trustedPaths.length === 0) {
+      console.log("    (none)");
+    } else {
+      for (const p of config.trustedPaths) console.log(`    ${String(p).replace(HOME, "~")}`);
+    }
+    console.log();
+    return;
+  }
+
+  // Remove
+  if (args.remove) {
+    const target = path.resolve(args.remove.replace(/^~/, HOME));
+    const before = config.trustedPaths.length;
+    config.trustedPaths = config.trustedPaths.filter(p => path.resolve(String(p)) !== target);
+    saveConfig(config);
+    if (config.trustedPaths.length < before) {
+      console.log(`\n  ✓ Removed trusted path: ${target}\n`);
+      audit("INFO", `trust-path removed: ${target}`);
+    } else {
+      console.log(`\n  ✗ Path was not in trust list: ${target}\n`);
+    }
+    return;
+  }
+
+  // Add (positional)
+  const target = args._positional?.[1];
+  if (!target) {
+    console.log(`
+  Usage: praxl trust-path <directory>
+
+  Adds a directory to the local allowlist of trusted skill base paths.
+  Required only if the Praxl server is configured to write skills outside
+  the standard locations (e.g. ~/.claude/skills).
+
+    praxl trust-path ~/dev/my-skills      Add a path
+    praxl trust-path --list               Show trusted paths
+    praxl trust-path --remove ~/dev/x     Remove a path
+`);
+    process.exit(1);
+  }
+
+  const resolved = path.resolve(target.replace(/^~/, HOME));
+  if (config.trustedPaths.some(p => path.resolve(String(p)) === resolved)) {
+    console.log(`\n  Already trusted: ${resolved}\n`);
+    return;
+  }
+  config.trustedPaths.push(resolved);
+  saveConfig(config);
+  console.log(`\n  ✓ Added trusted path: ${resolved}`);
+  console.log("    The Praxl server may now write skills to this location.\n");
+  audit("INFO", `trust-path added: ${resolved}`);
+}
+
 // ─── Parse args & dispatch ──────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -1179,11 +1338,14 @@ function parseArgs(argv) {
     else if (a === "--daemon") { args.daemon = true; }
     else if (a === "--ai") { args.ai = true; }
     else if (a === "--json") { args.json = true; }
+    else if (a === "--list") { args.list = true; }
+    else if (a === "--remove" && argv[i+1]) { args.remove = argv[++i]; }
     else if (a === "--version" || a === "-v") { args._cmd = "version"; }
     else if (a === "--help" || a === "-h") { args._cmd = "help"; }
     else if (!a.startsWith("-")) { positional.push(a); }
   }
   if (!args._cmd) args._cmd = positional[0] || "sync";
+  args._positional = positional;
   return args;
 }
 
@@ -1204,6 +1366,7 @@ function showHelp() {
     praxl sync --watch          Watch mode (poll every 30s)
     praxl import                Import local skills to Praxl cloud
     praxl status                Show your skills
+    praxl trust-path <dir>      Allow a custom skill directory (advanced)
 
   OPTIONS
     --token TOKEN             Auth token (auto-prompt if missing)
@@ -1237,6 +1400,8 @@ if (args._cmd === "help" || args._cmd === "--help" || args._cmd === "-h") {
   cmdImport(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "status") {
   cmdStatus(args).then(() => checkForUpdate()).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
+} else if (args._cmd === "trust-path") {
+  cmdTrustPath(args).catch(e => { console.error(`  ✗ ${e.message}\n`); process.exit(1); });
 } else if (args._cmd === "version" || args._cmd === "--version" || args._cmd === "-v") {
   console.log(`praxl v${VERSION}`);
   checkForUpdate();
